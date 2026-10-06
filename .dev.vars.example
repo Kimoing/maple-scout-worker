@@ -1,0 +1,4 @@
+GOOGLE_CLIENT_ID=your-google-oauth-web-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-google-oauth-web-client-secret
+GOOGLE_SPREADSHEET_ID=your-private-google-spreadsheet-id
+APP_ORIGINS=http://localhost:3000
