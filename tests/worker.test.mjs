@@ -11,10 +11,6 @@ const workerModule = await import(`data:text/javascript;base64,${Buffer.from(com
 const worker = workerModule.default;
 const env = {
   DB: {},
-  GOOGLE_CLIENT_ID: 'test-client-id',
-  GOOGLE_CLIENT_SECRET: 'test-client-secret',
-  GOOGLE_REFRESH_TOKEN: 'test-refresh-token',
-  GOOGLE_SPREADSHEET_ID: 'test-spreadsheet-id',
   APP_ORIGINS: 'https://app.example.test,http://localhost:3000',
 };
 
@@ -67,6 +63,79 @@ test('blocks an authenticated non-member from a group', async () => {
     }), env);
     assert.equal(response.status, 404);
     assert.deepEqual(await response.json(), { error: '그룹이 없거나 그룹 구성원이 아닙니다.' });
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.DB.prepare = originalPrepare;
+  }
+});
+
+test('accepts only a nickname for a multiplier refresh request', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalPrepare = env.DB.prepare;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    sub: 'google-subject',
+    email: 'member@example.test',
+    email_verified: true,
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  env.DB.prepare = (query) => ({
+    bind: () => ({
+      first: async () => query.includes('FROM groups') ? {
+        id: 'group-1',
+        name: 'Test group',
+        created_by_sub: 'google-subject',
+        created_by_email: 'member@example.test',
+        role: 'admin',
+      } : null,
+    }),
+  });
+  try {
+    const response = await worker.fetch(new Request('https://worker.example.test/api/groups/group-1/multipliers', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nickname: '오잉느', multipliers: [{ bossId: 'hard_kaling', multiplier: 30.67 }] }),
+    }), env);
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: 'nickname만 요청할 수 있습니다.' });
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.DB.prepare = originalPrepare;
+  }
+});
+
+test('adds a group boss to D1', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalPrepare = env.DB.prepare;
+  const statements = [];
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    sub: 'google-subject',
+    email: 'member@example.test',
+    email_verified: true,
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  env.DB.prepare = (query) => ({
+    bind: (...values) => {
+      statements.push({ query, values });
+      return {
+        first: async () => ({
+          id: 'group-1',
+          name: 'Test group',
+          created_by_sub: 'google-subject',
+          created_by_email: 'member@example.test',
+          role: 'admin',
+        }),
+        all: async () => ({ results: [] }),
+        run: async () => ({ success: true }),
+      };
+    },
+  });
+  try {
+    const response = await worker.fetch(new Request('https://worker.example.test/api/groups/group-1/bosses', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bossId: 'normal_kaling' }),
+    }), env);
+    assert.equal(response.status, 201);
+    assert.deepEqual(await response.json(), { bossId: 'normal_kaling', added: true });
+    assert.equal(statements.some(({ query }) => query.includes('INSERT INTO bosses')), true);
   } finally {
     globalThis.fetch = originalFetch;
     env.DB.prepare = originalPrepare;

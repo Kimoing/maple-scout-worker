@@ -5,15 +5,16 @@
   "compatibility_date": "2026-10-06",
   "workers_dev": true,
   "vars": {
-    "GOOGLE_CLIENT_ID": "your-google-oauth-web-client-id.apps.googleusercontent.com",
-    "GOOGLE_SPREADSHEET_ID": "your-private-google-spreadsheet-id",
     "APP_ORIGINS": "http://localhost:3000"
+  },
+  "browser": {
+    "binding": "BROWSER"
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "maple-scout-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_id": "51378fd6-ae13-4084-bb5b-9f8bcd2e3a0c",
       "migrations_dir": "migrations"
     }
   ]
