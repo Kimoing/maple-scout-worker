@@ -5,7 +5,7 @@
   "compatibility_date": "2026-10-06",
   "workers_dev": true,
   "vars": {
-    "APP_ORIGINS": "http://localhost:3000"
+    "APP_ORIGINS": "http://localhost:3000,https://vigilant-waffle-775qwj6wqg7xhjjp-3000.app.github.dev"
   },
   "browser": {
     "binding": "BROWSER"
