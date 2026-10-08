@@ -157,7 +157,9 @@ test('rejects a character missing from the Nexon API key account list', async ()
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     requestedPaths.push(url.pathname);
-    return new Response(JSON.stringify({ character_list: [{ character_name: 'different-character' }] }), {
+    return new Response(JSON.stringify({
+      account_list: [{ character_list: [{ character_name: 'different-character' }] }],
+    }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -201,8 +203,10 @@ test('verifies and stores a character present in the Nexon API key account list'
     requestedPaths.push(url.pathname);
     assert.equal(new Headers(options.headers).get('x-nxopen-api-key'), 'nexon-key');
     if (url.pathname.endsWith('/character/list')) {
-      assert.match(url.searchParams.get('date'), /^\d{4}-\d{2}-\d{2}$/);
-      return new Response(JSON.stringify({ character_list: [{ character_name: 'verified-character' }] }), {
+      assert.equal(url.searchParams.has('date'), false);
+      return new Response(JSON.stringify({
+        account_list: [{ character_list: [{ character_name: 'verified-character' }] }],
+      }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });

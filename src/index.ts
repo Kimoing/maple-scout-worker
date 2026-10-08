@@ -120,12 +120,14 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
   const headers = { 'x-nxopen-api-key': apiKey };
   const date = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
   const listUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/list');
-  listUrl.searchParams.set('date', date);
   const listResponse = await fetch(listUrl, { headers });
   const listResult = await listResponse.json().catch(() => ({})) as {
-    character_list?: Array<{ character_name?: string }>;
+    account_list?: Array<{ character_list?: Array<{ character_name?: string }> }>;
   };
-  if (!listResponse.ok || !listResult.character_list?.some((character) => character.character_name === nickname)) {
+  const ownsCharacter = listResult.account_list?.some((account) => (
+    account.character_list?.some((character) => character.character_name === nickname)
+  ));
+  if (!listResponse.ok || !ownsCharacter) {
     throw new ApiError(400, '입력한 닉네임이 Nexon API 키 계정의 캐릭터 목록에 없습니다.');
   }
 

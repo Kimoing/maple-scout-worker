@@ -53,6 +53,24 @@ npm run deploy
 curl https://YOUR_WORKER.YOUR_SUBDOMAIN.workers.dev/api/health
 ```
 
+## GitHub에 push
+
+변경사항을 커밋한 뒤 `main` 브랜치에 push합니다.
+
+```sh
+git add <파일>
+git commit -m "변경 내용"
+git push origin main
+```
+
+Codespaces에서 `Write access to repository not granted` 오류가 나면, 환경의 제한된 `GITHUB_TOKEN` 대신 저장된 GitHub 인증을 사용해 push합니다.
+
+```sh
+env -u GITHUB_TOKEN git push origin main
+```
+
+이 명령은 해당 push에만 `GITHUB_TOKEN`을 제외합니다. 그래도 거부되면 현재 GitHub 계정에 저장소 쓰기 권한이 있는지 확인합니다.
+
 ## API
 
 `GET /api/health` 외 모든 요청에는 `Authorization: Bearer <Google OAuth access token>`이 필요합니다. 프런트엔드는 `openid email profile` 범위로 로그인해야 합니다. 요청 본문은 64 KiB 이하이며, Worker의 `APP_ORIGINS`에 실제 웹 앱 Origin을 등록해야 합니다.
