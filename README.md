@@ -90,7 +90,7 @@ env -u GITHUB_TOKEN git push origin main
 | `GET` | `/api/groups/:id/multipliers` | 그룹 배율을 D1에서 조회 |
 | `POST` | `/api/groups/:id/multipliers` | 인증된 캐릭터의 MapleScouter 배율을 크롤링해 D1에 upsert |
 
-캐릭터 동기화 요청에는 Nexon API 키만 전달합니다. Worker는 응답에 포함된 모든 캐릭터에 대해 기본 정보와 스케줄러 현황을 조회한 뒤 Google 계정에 연결하고, API 키는 저장하지 않습니다. 기본 정보 조회에 실패한 캐릭터는 건너뛰고 나머지는 계속 동기화합니다. 스케줄러 조회에 실패해도 기본 정보가 있는 캐릭터는 등록하며, 스케줄 정보만 비워 둡니다. 캐릭터 기본 정보는 별도 조회 기준일 없이 가져오며, 스케줄러는 Nexon API의 `/maplestory/v1/scheduler/character-state` 응답을 사용합니다. 최신 현황이 필요하면 API 키를 다시 입력해 동기화합니다.
+캐릭터 동기화 요청에는 Nexon API 키만 전달합니다. Worker는 캐릭터 목록에서 260레벨 이상인 캐릭터만 기본 정보와 스케줄러 현황을 조회해 Google 계정에 연결하고, API 키는 저장하지 않습니다. Nexon API 요청은 동기화 요청 안에서 초당 최대 5회가 되도록 간격을 두고 전송합니다. 기본 정보 조회에 실패한 캐릭터는 해당 동기화에서 건너뛰지만, 이미 저장된 캐릭터 정보는 삭제하지 않습니다. 스케줄러 조회에 실패해도 기본 정보가 있는 캐릭터는 등록하며, 스케줄 정보만 비워 둡니다. 캐릭터 기본 정보는 별도 조회 기준일 없이 가져오며, 스케줄러는 Nexon API의 `/maplestory/v1/scheduler/character-state` 응답을 사용합니다. 최신 현황이 필요하면 API 키를 다시 입력해 동기화합니다.
 
 ```json
 {

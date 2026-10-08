@@ -190,6 +190,7 @@ test('associates every character from the Nexon API key with the Google account'
   const originalPrepare = env.DB.prepare;
   const originalBatch = env.DB.batch;
   const requestedPaths = [];
+  const requestTimes = [];
   let insertedStatements;
   globalThis.fetch = async (input, options) => {
     const url = new URL(input);
@@ -201,12 +202,19 @@ test('associates every character from the Nexon API key with the Google account'
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     requestedPaths.push(url.pathname);
+    requestTimes.push(performance.now());
     assert.equal(new Headers(options.headers).get('x-nxopen-api-key'), 'nexon-key');
     if (url.pathname.endsWith('/character/list')) {
       return new Response(JSON.stringify({
         account_list: [
-          { account_id: 'account-1', character_list: [{ ocid: 'ocid-1', character_name: 'first-character' }] },
-          { account_id: 'account-2', character_list: [{ character_name: 'second-character' }] },
+          { account_id: 'account-1', character_list: [{ ocid: 'ocid-1', character_name: 'first-character', character_level: 280 }] },
+          {
+            account_id: 'account-2',
+            character_list: [
+              { character_name: 'second-character', character_level: 260 },
+              { ocid: 'ocid-low-level', character_name: 'low-level-character', character_level: 259 },
+            ],
+          },
         ],
       }), {
         status: 200,
@@ -283,6 +291,8 @@ test('associates every character from the Nexon API key with the Google account'
     assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/id').length, 1);
     assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/character/basic').length, 2);
     assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/scheduler/character-state').length, 2);
+    assert.equal(requestTimes.length, 6);
+    assert.ok(requestTimes.slice(1).every((time, index) => time - requestTimes[index] >= 190));
     assert.deepEqual(insertedStatements.map(({ values }) => values.slice(0, 3)), [
       ['google-subject', 'first-character', 'ocid-1'],
       ['google-subject', 'second-character', 'resolved-second-character'],
@@ -315,14 +325,15 @@ test('skips characters with unavailable basic info and continues syncing the res
       return Response.json({
         account_list: [{
           character_list: [
-            { character_name: 'CeH1O1' },
-            { character_name: 'WorkingCharacter' },
+            { ocid: 'ocid-CeH1O1', character_name: 'CeH1O1', character_level: 280 },
+            { ocid: 'ocid-WorkingCharacter', character_name: 'WorkingCharacter', character_level: 280 },
+            { ocid: 'ocid-LowLevelCharacter', character_name: 'LowLevelCharacter', character_level: 259 },
           ],
         }],
       });
     }
     if (url.pathname.endsWith('/id')) {
-      return Response.json({ ocid: `ocid-${url.searchParams.get('character_name')}` });
+      throw new Error('Unexpected OCID lookup when the character list already contains OCIDs');
     }
     if (url.pathname.endsWith('/character/basic')) {
       if (url.searchParams.get('ocid') === 'ocid-CeH1O1') {
@@ -373,11 +384,12 @@ test('skips characters with unavailable basic info and continues syncing the res
     });
     assert.equal(statements.some(({ query, values }) => (
       query.includes('DELETE FROM characters') && values[1] === 'CeH1O1'
-    )), true);
+    )), false);
     assert.equal(statements.some(({ query, values }) => (
       query.includes('INSERT INTO characters') && values[1] === 'WorkingCharacter'
     )), true);
-    assert.equal(batches.length, 2);
+    assert.equal(statements.some(({ values }) => values.includes('LowLevelCharacter')), false);
+    assert.equal(batches.length, 1);
   } finally {
     globalThis.fetch = originalFetch;
     env.DB.prepare = originalPrepare;

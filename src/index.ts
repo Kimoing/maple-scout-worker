@@ -129,14 +129,24 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
   }
   const apiKey = stringField(body, 'apiKey', 256);
   const headers = { 'x-nxopen-api-key': apiKey };
+  let nextNexonRequestAt = 0;
+  const fetchNexon = async (input: URL): Promise<Response> => {
+    const now = Date.now();
+    const requestAt = Math.max(now, nextNexonRequestAt);
+    nextNexonRequestAt = requestAt + 200;
+    if (requestAt > now) {
+      await new Promise((resolve) => setTimeout(resolve, requestAt - now));
+    }
+    return fetch(input, { headers });
+  };
   const listUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/list');
-  const listResponse = await fetch(listUrl, { headers });
+  const listResponse = await fetchNexon(listUrl);
   if (!listResponse.ok) {
     throw new ApiError(400, `Nexon 캐릭터 목록 조회 실패: ${await nexonError(listResponse)}`);
   }
   const listResult = await listResponse.json().catch(() => ({})) as {
     account_list?: Array<{
-      character_list?: Array<{ ocid?: string; character_name?: string }>;
+      character_list?: Array<{ ocid?: string; character_name?: string; character_level?: number }>;
     }>;
   };
   const listedCharacters = [...new Map((listResult.account_list || [])
@@ -144,9 +154,12 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
     .flatMap((character) => {
       const nickname = typeof character.character_name === 'string' ? character.character_name.trim() : '';
       const ocid = typeof character.ocid === 'string' ? character.ocid.trim() : '';
-      return nickname && nickname.length <= 24 ? [[nickname.toLowerCase(), { nickname, ocid }]] : [];
+      const level = typeof character.character_level === 'number' ? character.character_level : 0;
+      return nickname && nickname.length <= 24 && level >= 260
+        ? [[nickname.toLowerCase(), { nickname, ocid }]]
+        : [];
     })).values()];
-  if (!listedCharacters.length) throw new ApiError(400, 'Nexon API 키 계정에서 캐릭터 목록을 찾을 수 없습니다.');
+  if (!listedCharacters.length) throw new ApiError(400, 'Nexon API 키 계정에서 260레벨 이상 캐릭터를 찾을 수 없습니다.');
 
   const characters: Array<{
     nickname: string;
@@ -165,7 +178,7 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
       if (!ocid) {
         const idUrl = new URL('https://open.api.nexon.com/maplestory/v1/id');
         idUrl.searchParams.set('character_name', nickname);
-        const idResponse = await fetch(idUrl, { headers });
+        const idResponse = await fetchNexon(idUrl);
         if (!idResponse.ok) {
           throw new ApiError(502, `${nickname} 캐릭터 OCID 조회 실패: ${await nexonError(idResponse)}`);
         }
@@ -179,8 +192,8 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
       const schedulerUrl = new URL('https://open.api.nexon.com/maplestory/v1/scheduler/character-state');
       schedulerUrl.searchParams.set('ocid', ocid);
       const [basicResponse, schedulerResponse] = await Promise.all([
-        fetch(basicUrl, { headers }),
-        fetch(schedulerUrl, { headers }),
+        fetchNexon(basicUrl),
+        fetchNexon(schedulerUrl),
       ]);
       if (!basicResponse.ok) {
         throw new ApiError(502, `${nickname} 캐릭터 기본 정보 조회 실패 (OCID: ${ocid}): ${await nexonError(basicResponse)}`);
@@ -220,12 +233,6 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
     }
   }
 
-  const deleteSkippedStatements = skippedCharacters.map((nickname) => env.DB.prepare(`
-    DELETE FROM characters WHERE google_sub = ? AND lower(nickname) = lower(?)
-  `).bind(principal.sub, nickname));
-  for (let offset = 0; offset < deleteSkippedStatements.length; offset += 100) {
-    await env.DB.batch(deleteSkippedStatements.slice(offset, offset + 100));
-  }
   if (!characters.length) {
     throw new ApiError(502, `Nexon API에서 캐릭터 기본 정보를 가져오지 못했습니다. 건너뛴 캐릭터: ${skippedCharacters.join(', ')}`);
   }
