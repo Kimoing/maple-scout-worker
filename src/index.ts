@@ -87,6 +87,15 @@ function stringField(body: Record<string, unknown>, name: string, maxLength: num
   return value;
 }
 
+async function nexonError(response: Response): Promise<string> {
+  const result = await response.json().catch(() => ({})) as {
+    error?: { name?: unknown; message?: unknown };
+  };
+  const name = typeof result.error?.name === 'string' ? result.error.name : '';
+  const message = typeof result.error?.message === 'string' ? result.error.message : '';
+  return [name, message].filter(Boolean).join(': ') || `HTTP ${response.status}`;
+}
+
 async function getGroup(env: Env, groupId: string, email: string): Promise<GroupRow> {
   const group = await env.DB.prepare(`
     SELECT g.id, g.name, g.created_by_sub, g.created_by_email, m.role
@@ -122,7 +131,9 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
   const headers = { 'x-nxopen-api-key': apiKey };
   const listUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/list');
   const listResponse = await fetch(listUrl, { headers });
-  if (!listResponse.ok) throw new ApiError(400, 'Nexon API 키를 확인할 수 없습니다.');
+  if (!listResponse.ok) {
+    throw new ApiError(400, `Nexon 캐릭터 목록 조회 실패: ${await nexonError(listResponse)}`);
+  }
   const listResult = await listResponse.json().catch(() => ({})) as {
     account_list?: Array<{
       character_list?: Array<{ ocid?: string; character_name?: string }>;
@@ -146,18 +157,20 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
     image: string;
     scheduler: Record<string, unknown>;
   }> = [];
+  const skippedCharacters: string[] = [];
+  const schedulerUnavailable: string[] = [];
   for (let offset = 0; offset < listedCharacters.length; offset += 3) {
-    const batch = await Promise.all(listedCharacters.slice(offset, offset + 3).map(async ({ nickname, ocid: listedOcid }) => {
-      let ocid = listedOcid;
-      if (!ocid) {
-        const idUrl = new URL('https://open.api.nexon.com/maplestory/v1/id');
-        idUrl.searchParams.set('character_name', nickname);
-        const idResponse = await fetch(idUrl, { headers });
-        if (!idResponse.ok) throw new ApiError(502, `${nickname} 캐릭터 OCID를 Nexon API에서 가져오지 못했습니다.`);
-        const idResult = await idResponse.json() as { ocid?: string };
-        ocid = typeof idResult.ocid === 'string' ? idResult.ocid.trim() : '';
-        if (!ocid) throw new ApiError(502, `${nickname} 캐릭터 OCID를 Nexon API 응답에서 찾을 수 없습니다.`);
+    const batch = await Promise.allSettled(listedCharacters.slice(offset, offset + 3).map(async ({ nickname }) => {
+      const idUrl = new URL('https://open.api.nexon.com/maplestory/v1/id');
+      idUrl.searchParams.set('character_name', nickname);
+      const idResponse = await fetch(idUrl, { headers });
+      if (!idResponse.ok) {
+        throw new ApiError(502, `${nickname} 캐릭터 OCID 조회 실패: ${await nexonError(idResponse)}`);
       }
+      const idResult = await idResponse.json() as { ocid?: string };
+      const ocid = typeof idResult.ocid === 'string' ? idResult.ocid.trim() : '';
+      if (!ocid) throw new ApiError(502, `${nickname} 캐릭터 OCID를 Nexon API 응답에서 찾을 수 없습니다.`);
+
       const basicUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/basic');
       basicUrl.searchParams.set('ocid', ocid);
       const schedulerUrl = new URL('https://open.api.nexon.com/maplestory/v1/scheduler/character-state');
@@ -166,15 +179,25 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
         fetch(basicUrl, { headers }),
         fetch(schedulerUrl, { headers }),
       ]);
-      if (!basicResponse.ok) throw new ApiError(502, `${nickname} 캐릭터 정보를 Nexon API에서 가져오지 못했습니다.`);
-      if (!schedulerResponse.ok) throw new ApiError(502, `${nickname} 스케줄러 정보를 Nexon API에서 가져오지 못했습니다.`);
+      if (!basicResponse.ok) {
+        throw new ApiError(502, `${nickname} 캐릭터 기본 정보 조회 실패 (OCID: ${ocid}): ${await nexonError(basicResponse)}`);
+      }
       const basic = await basicResponse.json() as {
         world_name?: string;
         character_class?: string;
         character_level?: number;
         character_image?: string;
       };
-      const scheduler = await schedulerResponse.json() as Record<string, unknown>;
+      let scheduler: Record<string, unknown> = {};
+      if (schedulerResponse.ok) {
+        try {
+          scheduler = await schedulerResponse.json() as Record<string, unknown>;
+        } catch {
+          schedulerUnavailable.push(nickname);
+        }
+      } else {
+        schedulerUnavailable.push(nickname);
+      }
       return {
         nickname,
         ocid,
@@ -185,7 +208,23 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
         scheduler,
       };
     }));
-    characters.push(...batch);
+    for (const [index, result] of batch.entries()) {
+      if (result.status === 'fulfilled') {
+        characters.push(result.value);
+      } else {
+        skippedCharacters.push(listedCharacters[offset + index].nickname);
+      }
+    }
+  }
+
+  const deleteSkippedStatements = skippedCharacters.map((nickname) => env.DB.prepare(`
+    DELETE FROM characters WHERE google_sub = ? AND lower(nickname) = lower(?)
+  `).bind(principal.sub, nickname));
+  for (let offset = 0; offset < deleteSkippedStatements.length; offset += 100) {
+    await env.DB.batch(deleteSkippedStatements.slice(offset, offset + 100));
+  }
+  if (!characters.length) {
+    throw new ApiError(502, `Nexon API에서 캐릭터 기본 정보를 가져오지 못했습니다. 건너뛴 캐릭터: ${skippedCharacters.join(', ')}`);
   }
 
   const verifiedAt = new Date().toISOString();
@@ -220,7 +259,7 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
     await env.DB.batch(statements.slice(offset, offset + 100));
   }
 
-  return json({ characters, verified: true });
+  return json({ characters, skippedCharacters, schedulerUnavailable, verified: true });
 }
 
 async function createGroup(env: Env, principal: GooglePrincipal, body: Record<string, unknown>): Promise<Response> {

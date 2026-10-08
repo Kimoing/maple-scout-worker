@@ -175,7 +175,7 @@ test('rejects an invalid Nexon API key before database writes', async () => {
       body: JSON.stringify({ apiKey: 'invalid-key' }),
     }), env);
     assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), { error: 'Nexon API 키를 확인할 수 없습니다.' });
+    assert.deepEqual(await response.json(), { error: 'Nexon 캐릭터 목록 조회 실패: Invalid API key' });
     assert.deepEqual(requestedPaths, ['/maplestory/v1/character/list']);
     assert.equal(databaseWrites, 0);
   } finally {
@@ -214,16 +214,17 @@ test('associates every character from the Nexon API key with the Google account'
       });
     }
     if (url.pathname.endsWith('/id')) {
-      assert.equal(url.searchParams.get('character_name'), 'second-character');
-      return Response.json({ ocid: 'ocid-2' });
+      const nickname = url.searchParams.get('character_name');
+      assert.ok(['first-character', 'second-character'].includes(nickname));
+      return Response.json({ ocid: `resolved-${nickname}` });
     }
     if (url.pathname.endsWith('/character/basic')) {
       assert.equal(url.searchParams.has('date'), false);
-      assert.ok(['ocid-1', 'ocid-2'].includes(url.searchParams.get('ocid')));
+      assert.ok(['resolved-first-character', 'resolved-second-character'].includes(url.searchParams.get('ocid')));
       return Response.json({
         world_name: 'Scania',
         character_class: 'Hero',
-        character_level: url.searchParams.get('ocid') === 'ocid-1' ? 280 : 260,
+        character_level: url.searchParams.get('ocid') === 'resolved-first-character' ? 280 : 260,
         character_image: `https://image.example.test/${url.searchParams.get('ocid')}.png`,
       });
     }
@@ -250,11 +251,11 @@ test('associates every character from the Nexon API key with the Google account'
     assert.deepEqual(result.characters, [
       {
         nickname: 'first-character',
-        ocid: 'ocid-1',
+        ocid: 'resolved-first-character',
         worldName: 'Scania',
         characterClass: 'Hero',
         level: 280,
-        image: 'https://image.example.test/ocid-1.png',
+        image: 'https://image.example.test/resolved-first-character.png',
         scheduler: {
           date: '2026-10-08',
           daily_contents: [{ content_name: 'Daily Quest', now_count: 1, max_count: 3 }],
@@ -264,11 +265,11 @@ test('associates every character from the Nexon API key with the Google account'
       },
       {
         nickname: 'second-character',
-        ocid: 'ocid-2',
+        ocid: 'resolved-second-character',
         worldName: 'Scania',
         characterClass: 'Hero',
         level: 260,
-        image: 'https://image.example.test/ocid-2.png',
+        image: 'https://image.example.test/resolved-second-character.png',
         scheduler: {
           date: '2026-10-08',
           daily_contents: [{ content_name: 'Daily Quest', now_count: 1, max_count: 3 }],
@@ -279,15 +280,104 @@ test('associates every character from the Nexon API key with the Google account'
     ]);
     assert.equal(result.verified, true);
     assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/character/list').length, 1);
-    assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/id').length, 1);
+    assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/id').length, 2);
     assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/character/basic').length, 2);
     assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/scheduler/character-state').length, 2);
     assert.deepEqual(insertedStatements.map(({ values }) => values.slice(0, 3)), [
-      ['google-subject', 'first-character', 'ocid-1'],
-      ['google-subject', 'second-character', 'ocid-2'],
+      ['google-subject', 'first-character', 'resolved-first-character'],
+      ['google-subject', 'second-character', 'resolved-second-character'],
     ]);
     assert.equal(JSON.parse(insertedStatements[0].values[8]).date, '2026-10-08');
     assert.equal(insertedStatements.some(({ values }) => values.includes('nexon-key')), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.DB.prepare = originalPrepare;
+    env.DB.batch = originalBatch;
+  }
+});
+
+test('skips characters with unavailable basic info and continues syncing the rest', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalPrepare = env.DB.prepare;
+  const originalBatch = env.DB.batch;
+  const statements = [];
+  const batches = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(input);
+    if (url.hostname === 'openidconnect.googleapis.com') {
+      return Response.json({
+        sub: 'google-subject',
+        email: 'member@example.test',
+        email_verified: true,
+      });
+    }
+    if (url.pathname.endsWith('/character/list')) {
+      return Response.json({
+        account_list: [{
+          character_list: [
+            { character_name: 'CeH1O1' },
+            { character_name: 'WorkingCharacter' },
+          ],
+        }],
+      });
+    }
+    if (url.pathname.endsWith('/id')) {
+      return Response.json({ ocid: `ocid-${url.searchParams.get('character_name')}` });
+    }
+    if (url.pathname.endsWith('/character/basic')) {
+      if (url.searchParams.get('ocid') === 'ocid-CeH1O1') {
+        return Response.json({
+          error: { name: 'OPENAPI00004', message: 'Invalid Parameter' },
+        }, { status: 400 });
+      }
+      return Response.json({
+        world_name: 'Scania',
+        character_class: 'Hero',
+        character_level: 280,
+        character_image: 'https://image.example.test/working.png',
+      });
+    }
+    if (url.pathname.endsWith('/scheduler/character-state')) {
+      return new Response('{}', { status: 429 });
+    }
+    throw new Error(`Unexpected Nexon API request: ${url.pathname}`);
+  };
+  env.DB.prepare = (query) => ({
+    bind: (...values) => {
+      const statement = { query, values };
+      statements.push(statement);
+      return statement;
+    },
+  });
+  env.DB.batch = async (batch) => { batches.push(batch); };
+  try {
+    const response = await worker.fetch(new Request('https://worker.example.test/api/characters/verify', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer test-access-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: 'nexon-key' }),
+    }), env);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      characters: [{
+        nickname: 'WorkingCharacter',
+        ocid: 'ocid-WorkingCharacter',
+        worldName: 'Scania',
+        characterClass: 'Hero',
+        level: 280,
+        image: 'https://image.example.test/working.png',
+        scheduler: {},
+      }],
+      skippedCharacters: ['CeH1O1'],
+      schedulerUnavailable: ['WorkingCharacter'],
+      verified: true,
+    });
+    assert.equal(statements.some(({ query, values }) => (
+      query.includes('DELETE FROM characters') && values[1] === 'CeH1O1'
+    )), true);
+    assert.equal(statements.some(({ query, values }) => (
+      query.includes('INSERT INTO characters') && values[1] === 'WorkingCharacter'
+    )), true);
+    assert.equal(batches.length, 2);
   } finally {
     globalThis.fetch = originalFetch;
     env.DB.prepare = originalPrepare;
