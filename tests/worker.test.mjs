@@ -141,3 +141,108 @@ test('adds a group boss to D1', async () => {
     env.DB.prepare = originalPrepare;
   }
 });
+
+test('rejects a character missing from the Nexon API key account list', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalPrepare = env.DB.prepare;
+  const requestedPaths = [];
+  let databaseWrites = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input);
+    if (url.hostname === 'openidconnect.googleapis.com') {
+      return new Response(JSON.stringify({
+        sub: 'google-subject',
+        email: 'member@example.test',
+        email_verified: true,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    requestedPaths.push(url.pathname);
+    return new Response(JSON.stringify({ character_list: [{ character_name: 'different-character' }] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  env.DB.prepare = () => {
+    databaseWrites += 1;
+    throw new Error('Unexpected database access');
+  };
+  try {
+    const response = await worker.fetch(new Request('https://worker.example.test/api/characters/verify', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nickname: 'not-owned-character', apiKey: 'nexon-key' }),
+    }), env);
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), {
+      error: '입력한 닉네임이 Nexon API 키 계정의 캐릭터 목록에 없습니다.',
+    });
+    assert.deepEqual(requestedPaths, ['/maplestory/v1/character/list']);
+    assert.equal(databaseWrites, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.DB.prepare = originalPrepare;
+  }
+});
+
+test('verifies and stores a character present in the Nexon API key account list', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalPrepare = env.DB.prepare;
+  const requestedPaths = [];
+  let insertedValues;
+  globalThis.fetch = async (input, options) => {
+    const url = new URL(input);
+    if (url.hostname === 'openidconnect.googleapis.com') {
+      return new Response(JSON.stringify({
+        sub: 'google-subject',
+        email: 'member@example.test',
+        email_verified: true,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    requestedPaths.push(url.pathname);
+    assert.equal(new Headers(options.headers).get('x-nxopen-api-key'), 'nexon-key');
+    if (url.pathname.endsWith('/character/list')) {
+      assert.match(url.searchParams.get('date'), /^\d{4}-\d{2}-\d{2}$/);
+      return new Response(JSON.stringify({ character_list: [{ character_name: 'verified-character' }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.pathname.endsWith('/id')) {
+      return new Response(JSON.stringify({ ocid: 'character-ocid' }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ character_name: 'verified-character' }), { status: 200 });
+  };
+  env.DB.prepare = (query) => ({
+    bind: (...values) => ({
+      run: async () => {
+        assert.match(query, /INSERT INTO characters/);
+        insertedValues = values;
+        return { success: true };
+      },
+    }),
+  });
+  try {
+    const response = await worker.fetch(new Request('https://worker.example.test/api/characters/verify', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nickname: 'verified-character', apiKey: 'nexon-key' }),
+    }), env);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      nickname: 'verified-character',
+      ocid: 'character-ocid',
+      verified: true,
+    });
+    assert.deepEqual(requestedPaths, [
+      '/maplestory/v1/character/list',
+      '/maplestory/v1/id',
+      '/maplestory/v1/character/basic',
+    ]);
+    assert.equal(insertedValues[0], 'google-subject');
+    assert.equal(insertedValues[1], 'verified-character');
+    assert.equal(insertedValues[2], 'character-ocid');
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.DB.prepare = originalPrepare;
+  }
+});

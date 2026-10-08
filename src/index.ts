@@ -118,6 +118,17 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
   const nickname = stringField(body, 'nickname', 24);
   const apiKey = stringField(body, 'apiKey', 256);
   const headers = { 'x-nxopen-api-key': apiKey };
+  const date = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+  const listUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/list');
+  listUrl.searchParams.set('date', date);
+  const listResponse = await fetch(listUrl, { headers });
+  const listResult = await listResponse.json().catch(() => ({})) as {
+    character_list?: Array<{ character_name?: string }>;
+  };
+  if (!listResponse.ok || !listResult.character_list?.some((character) => character.character_name === nickname)) {
+    throw new ApiError(400, '입력한 닉네임이 Nexon API 키 계정의 캐릭터 목록에 없습니다.');
+  }
+
   const idUrl = new URL('https://open.api.nexon.com/maplestory/v1/id');
   idUrl.searchParams.set('character_name', nickname);
   const idResponse = await fetch(idUrl, { headers });
@@ -126,7 +137,7 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
 
   const basicUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/basic');
   basicUrl.searchParams.set('ocid', idResult.ocid);
-  basicUrl.searchParams.set('date', new Date(Date.now() - 86_400_000).toISOString().slice(0, 10));
+  basicUrl.searchParams.set('date', date);
   const basicResponse = await fetch(basicUrl, { headers });
   const basicResult = await basicResponse.json().catch(() => ({})) as { character_name?: string };
   if (!basicResponse.ok || basicResult.character_name !== nickname) {
