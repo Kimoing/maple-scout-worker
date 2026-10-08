@@ -374,6 +374,15 @@ type MapleScouterResult = {
   boss380HexaScore: number | null;
 };
 
+function logMapleScouterSetupFailure(stage: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error('MapleScouter browser setup failed', {
+    stage,
+    errorName: error instanceof Error ? error.name : 'UnknownError',
+    message: message.replace(/https?:\/\/\S+/g, '[url]').slice(0, 300),
+  });
+}
+
 async function scrapeMapleScouterResult(
   page: import('@cloudflare/puppeteer').Page,
   nickname: string,
@@ -457,14 +466,16 @@ async function refreshCharacterScores(
   let puppeteer;
   try {
     ({ default: puppeteer } = await import('@cloudflare/puppeteer'));
-  } catch {
+  } catch (error) {
+    logMapleScouterSetupFailure('import', error);
     throw new ApiError(502, 'MapleScouter 점수를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
   }
 
   let browser;
   try {
     browser = await puppeteer.launch(env.BROWSER);
-  } catch {
+  } catch (error) {
+    logMapleScouterSetupFailure('launch', error);
     throw new ApiError(502, 'MapleScouter 점수를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
   }
   try {
