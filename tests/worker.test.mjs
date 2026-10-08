@@ -206,11 +206,33 @@ test('associates every character from the Nexon API key with the Google account'
       return new Response(JSON.stringify({
         account_list: [
           { account_id: 'account-1', character_list: [{ ocid: 'ocid-1', character_name: 'first-character' }] },
-          { account_id: 'account-2', character_list: [{ ocid: 'ocid-2', character_name: 'second-character' }] },
+          { account_id: 'account-2', character_list: [{ character_name: 'second-character' }] },
         ],
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.pathname.endsWith('/id')) {
+      assert.equal(url.searchParams.get('character_name'), 'second-character');
+      return Response.json({ ocid: 'ocid-2' });
+    }
+    if (url.pathname.endsWith('/character/basic')) {
+      assert.equal(url.searchParams.has('date'), false);
+      assert.ok(['ocid-1', 'ocid-2'].includes(url.searchParams.get('ocid')));
+      return Response.json({
+        world_name: 'Scania',
+        character_class: 'Hero',
+        character_level: url.searchParams.get('ocid') === 'ocid-1' ? 280 : 260,
+        character_image: `https://image.example.test/${url.searchParams.get('ocid')}.png`,
+      });
+    }
+    if (url.pathname.endsWith('/scheduler/character-state')) {
+      return Response.json({
+        date: '2026-10-08',
+        daily_contents: [{ content_name: 'Daily Quest', now_count: 1, max_count: 3 }],
+        weekly_contents: [],
+        boss_contents: [{ content_name: 'Hard Boss', complete_flag: 'false' }],
       });
     }
     throw new Error(`Unexpected Nexon API request: ${url.pathname}`);
@@ -224,21 +246,100 @@ test('associates every character from the Nexon API key with the Google account'
       body: JSON.stringify({ apiKey: 'nexon-key' }),
     }), env);
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), {
-      characters: [
-        { nickname: 'first-character', ocid: 'ocid-1' },
-        { nickname: 'second-character', ocid: 'ocid-2' },
-      ],
-      verified: true,
-    });
-    assert.deepEqual(requestedPaths, ['/maplestory/v1/character/list']);
+    const result = await response.json();
+    assert.deepEqual(result.characters, [
+      {
+        nickname: 'first-character',
+        ocid: 'ocid-1',
+        worldName: 'Scania',
+        characterClass: 'Hero',
+        level: 280,
+        image: 'https://image.example.test/ocid-1.png',
+        scheduler: {
+          date: '2026-10-08',
+          daily_contents: [{ content_name: 'Daily Quest', now_count: 1, max_count: 3 }],
+          weekly_contents: [],
+          boss_contents: [{ content_name: 'Hard Boss', complete_flag: 'false' }],
+        },
+      },
+      {
+        nickname: 'second-character',
+        ocid: 'ocid-2',
+        worldName: 'Scania',
+        characterClass: 'Hero',
+        level: 260,
+        image: 'https://image.example.test/ocid-2.png',
+        scheduler: {
+          date: '2026-10-08',
+          daily_contents: [{ content_name: 'Daily Quest', now_count: 1, max_count: 3 }],
+          weekly_contents: [],
+          boss_contents: [{ content_name: 'Hard Boss', complete_flag: 'false' }],
+        },
+      },
+    ]);
+    assert.equal(result.verified, true);
+    assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/character/list').length, 1);
+    assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/id').length, 1);
+    assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/character/basic').length, 2);
+    assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/scheduler/character-state').length, 2);
     assert.deepEqual(insertedStatements.map(({ values }) => values.slice(0, 3)), [
       ['google-subject', 'first-character', 'ocid-1'],
       ['google-subject', 'second-character', 'ocid-2'],
     ]);
+    assert.equal(JSON.parse(insertedStatements[0].values[8]).date, '2026-10-08');
+    assert.equal(insertedStatements.some(({ values }) => values.includes('nexon-key')), false);
   } finally {
     globalThis.fetch = originalFetch;
     env.DB.prepare = originalPrepare;
     env.DB.batch = originalBatch;
+  }
+});
+
+test('returns saved character profiles and scheduler data after sign-in', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalPrepare = env.DB.prepare;
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    sub: 'google-subject',
+    email: 'member@example.test',
+    email_verified: true,
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  env.DB.prepare = () => ({
+    bind: () => ({
+      all: async () => ({
+        results: [{
+          nickname: 'first-character',
+          ocid: 'ocid-1',
+          verifiedAt: '2026-10-08T00:00:00.000Z',
+          worldName: 'Scania',
+          characterClass: 'Hero',
+          level: 280,
+          image: 'https://image.example.test/ocid-1.png',
+          schedulerJson: JSON.stringify({ date: '2026-10-08', daily_contents: [] }),
+          schedulerDate: '2026-10-08',
+        }],
+      }),
+    }),
+  });
+  try {
+    const response = await worker.fetch(new Request('https://worker.example.test/api/characters', {
+      headers: { Authorization: 'Bearer test-access-token' },
+    }), env);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      characters: [{
+        nickname: 'first-character',
+        ocid: 'ocid-1',
+        verifiedAt: '2026-10-08T00:00:00.000Z',
+        worldName: 'Scania',
+        characterClass: 'Hero',
+        level: 280,
+        image: 'https://image.example.test/ocid-1.png',
+        schedulerDate: '2026-10-08',
+        scheduler: { date: '2026-10-08', daily_contents: [] },
+      }],
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.DB.prepare = originalPrepare;
   }
 });

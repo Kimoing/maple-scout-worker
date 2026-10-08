@@ -115,6 +115,9 @@ async function getBossIds(env: Env, groupId: string): Promise<string[]> {
 }
 
 async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Record<string, unknown>): Promise<Response> {
+  if (Object.keys(body).some((key) => key !== 'apiKey')) {
+    throw new ApiError(400, 'apiKey만 요청할 수 있습니다.');
+  }
   const apiKey = stringField(body, 'apiKey', 256);
   const headers = { 'x-nxopen-api-key': apiKey };
   const listUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/list');
@@ -125,21 +128,94 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
       character_list?: Array<{ ocid?: string; character_name?: string }>;
     }>;
   };
-  const characters = [...new Map((listResult.account_list || [])
+  const listedCharacters = [...new Map((listResult.account_list || [])
     .flatMap((account) => account.character_list || [])
     .flatMap((character) => {
       const nickname = typeof character.character_name === 'string' ? character.character_name.trim() : '';
       const ocid = typeof character.ocid === 'string' ? character.ocid.trim() : '';
-      return nickname && nickname.length <= 24 && ocid ? [[ocid, { nickname, ocid }]] : [];
+      return nickname && nickname.length <= 24 ? [[nickname.toLowerCase(), { nickname, ocid }]] : [];
     })).values()];
-  if (!characters.length) throw new ApiError(400, 'Nexon API 키 계정에서 캐릭터 목록을 찾을 수 없습니다.');
+  if (!listedCharacters.length) throw new ApiError(400, 'Nexon API 키 계정에서 캐릭터 목록을 찾을 수 없습니다.');
+
+  const characters: Array<{
+    nickname: string;
+    ocid: string;
+    worldName: string;
+    characterClass: string;
+    level: number;
+    image: string;
+    scheduler: Record<string, unknown>;
+  }> = [];
+  for (let offset = 0; offset < listedCharacters.length; offset += 3) {
+    const batch = await Promise.all(listedCharacters.slice(offset, offset + 3).map(async ({ nickname, ocid: listedOcid }) => {
+      let ocid = listedOcid;
+      if (!ocid) {
+        const idUrl = new URL('https://open.api.nexon.com/maplestory/v1/id');
+        idUrl.searchParams.set('character_name', nickname);
+        const idResponse = await fetch(idUrl, { headers });
+        if (!idResponse.ok) throw new ApiError(502, `${nickname} 캐릭터 OCID를 Nexon API에서 가져오지 못했습니다.`);
+        const idResult = await idResponse.json() as { ocid?: string };
+        ocid = typeof idResult.ocid === 'string' ? idResult.ocid.trim() : '';
+        if (!ocid) throw new ApiError(502, `${nickname} 캐릭터 OCID를 Nexon API 응답에서 찾을 수 없습니다.`);
+      }
+      const basicUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/basic');
+      basicUrl.searchParams.set('ocid', ocid);
+      const schedulerUrl = new URL('https://open.api.nexon.com/maplestory/v1/scheduler/character-state');
+      schedulerUrl.searchParams.set('ocid', ocid);
+      const [basicResponse, schedulerResponse] = await Promise.all([
+        fetch(basicUrl, { headers }),
+        fetch(schedulerUrl, { headers }),
+      ]);
+      if (!basicResponse.ok) throw new ApiError(502, `${nickname} 캐릭터 정보를 Nexon API에서 가져오지 못했습니다.`);
+      if (!schedulerResponse.ok) throw new ApiError(502, `${nickname} 스케줄러 정보를 Nexon API에서 가져오지 못했습니다.`);
+      const basic = await basicResponse.json() as {
+        world_name?: string;
+        character_class?: string;
+        character_level?: number;
+        character_image?: string;
+      };
+      const scheduler = await schedulerResponse.json() as Record<string, unknown>;
+      return {
+        nickname,
+        ocid,
+        worldName: typeof basic.world_name === 'string' ? basic.world_name : '',
+        characterClass: typeof basic.character_class === 'string' ? basic.character_class : '',
+        level: typeof basic.character_level === 'number' ? basic.character_level : 0,
+        image: typeof basic.character_image === 'string' ? basic.character_image : '',
+        scheduler,
+      };
+    }));
+    characters.push(...batch);
+  }
 
   const verifiedAt = new Date().toISOString();
-  const statements = characters.map(({ nickname, ocid }) => env.DB.prepare(`
-    INSERT INTO characters (google_sub, nickname, ocid, verified_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT (google_sub, nickname) DO UPDATE SET ocid = excluded.ocid, verified_at = excluded.verified_at
-  `).bind(principal.sub, nickname, ocid, verifiedAt));
+  const statements = characters.map((character) => env.DB.prepare(`
+    INSERT INTO characters (
+      google_sub, nickname, ocid, verified_at, world_name, character_class, character_level, character_image,
+      scheduler_json, scheduler_date
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (google_sub, nickname) DO UPDATE SET
+      ocid = excluded.ocid,
+      verified_at = excluded.verified_at,
+      world_name = excluded.world_name,
+      character_class = excluded.character_class,
+      character_level = excluded.character_level,
+      character_image = excluded.character_image,
+      scheduler_json = excluded.scheduler_json,
+      scheduler_date = excluded.scheduler_date
+  `).bind(
+    principal.sub,
+    character.nickname,
+    character.ocid,
+    verifiedAt,
+    character.worldName,
+    character.characterClass,
+    character.level,
+    character.image,
+    JSON.stringify(character.scheduler),
+    typeof character.scheduler.date === 'string' ? character.scheduler.date : new Date().toISOString().slice(0, 10),
+  ));
   for (let offset = 0; offset < statements.length; offset += 100) {
     await env.DB.batch(statements.slice(offset, offset + 100));
   }
@@ -171,10 +247,26 @@ async function listGroups(env: Env, principal: GooglePrincipal): Promise<Respons
 
 async function listCharacters(env: Env, principal: GooglePrincipal): Promise<Response> {
   const result = await env.DB.prepare(`
-    SELECT nickname, ocid, verified_at AS verifiedAt
+    SELECT nickname, ocid, verified_at AS verifiedAt, world_name AS worldName,
+      character_class AS characterClass, character_level AS level, character_image AS image,
+      scheduler_json AS schedulerJson, scheduler_date AS schedulerDate
     FROM characters WHERE google_sub = ? ORDER BY verified_at DESC
-  `).bind(principal.sub).all();
-  return json({ characters: result.results || [] });
+  `).bind(principal.sub).all<{
+    nickname: string;
+    ocid: string;
+    verifiedAt: string;
+    worldName: string;
+    characterClass: string;
+    level: number;
+    image: string;
+    schedulerJson: string;
+    schedulerDate: string;
+  }>();
+  const characters = (result.results || []).map(({ schedulerJson, ...character }) => ({
+    ...character,
+    scheduler: JSON.parse(schedulerJson),
+  }));
+  return json({ characters });
 }
 
 async function addGroupMember(env: Env, groupId: string, principal: GooglePrincipal, body: Record<string, unknown>): Promise<Response> {

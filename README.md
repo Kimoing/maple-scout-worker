@@ -6,6 +6,7 @@
 
 - 브라우저는 Google Identity Services access token을 보냅니다. Worker는 Google UserInfo에서 토큰과 인증된 이메일을 확인합니다. Google API, client secret, refresh token은 사용하지 않습니다.
 - Cloudflare D1에는 Google 계정 subject, 인증 캐릭터, 그룹 소유자, 그룹 멤버십, 보스 목록, 배율을 저장합니다.
+- Nexon API 키를 입력하면 해당 키의 전체 캐릭터 목록을 동기화하고 캐릭터 기본 정보와 스케줄러 수행 현황을 함께 저장합니다. API 키는 요청 처리 중에만 사용하며 저장하지 않습니다.
 - 배율 갱신은 그룹 멤버십과 해당 Google 계정에 연결된 캐릭터인지 확인한 뒤, Worker의 Browser Rendering으로 MapleScouter를 열어 처리합니다.
 - Nexon API 키는 캐릭터 인증 요청을 위해 HTTPS로 Worker에 전달되지만 저장하거나 로그에 남기지 않습니다. 키가 사용자 컴퓨터 밖으로 절대 나가면 안 된다면 Worker가 인증을 독립적으로 검증할 수 없습니다.
 
@@ -78,8 +79,8 @@ env -u GITHUB_TOKEN git push origin main
 | Method | Route | 기능 |
 | --- | --- | --- |
 | `GET` | `/api/health` | 공개 상태 확인 |
-| `POST` | `/api/characters/verify` | Nexon API 키 계정의 전체 캐릭터를 Google 계정에 연결 |
-| `GET` | `/api/characters` | 로그인 사용자의 인증 캐릭터 목록 |
+| `POST` | `/api/characters/verify` | API 키 계정의 전체 캐릭터, 기본 정보, 스케줄러 현황 동기화 |
+| `GET` | `/api/characters` | 로그인 사용자의 캐릭터 및 저장된 스케줄러 현황 조회 |
 | `GET` | `/api/groups` | 로그인 사용자가 속한 그룹 목록 |
 | `POST` | `/api/groups` | D1에 그룹 생성, 요청 사용자를 관리자 지정 |
 | `POST` | `/api/groups/:id/members` | 그룹 관리자가 이메일 멤버 추가 |
@@ -89,7 +90,7 @@ env -u GITHUB_TOKEN git push origin main
 | `GET` | `/api/groups/:id/multipliers` | 그룹 배율을 D1에서 조회 |
 | `POST` | `/api/groups/:id/multipliers` | 인증된 캐릭터의 MapleScouter 배율을 크롤링해 D1에 upsert |
 
-캐릭터 연결 요청에는 Nexon API 키만 전달합니다. Worker는 응답에 포함된 모든 캐릭터를 Google 계정에 연결하고, API 키는 저장하지 않습니다.
+캐릭터 동기화 요청에는 Nexon API 키만 전달합니다. Worker는 응답에 포함된 모든 캐릭터에 대해 기본 정보와 스케줄러 현황을 조회한 뒤 Google 계정에 연결하고, API 키는 저장하지 않습니다. 캐릭터 기본 정보는 별도 조회 기준일 없이 가져오며, 스케줄러는 Nexon API의 `/maplestory/v1/scheduler/character-state` 응답을 사용합니다. 최신 현황이 필요하면 API 키를 다시 입력해 동기화합니다.
 
 ```json
 {
