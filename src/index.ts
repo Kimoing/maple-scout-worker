@@ -298,7 +298,8 @@ async function listCharacters(env: Env, principal: GooglePrincipal): Promise<Res
   const result = await env.DB.prepare(`
     SELECT nickname, ocid, verified_at AS verifiedAt, world_name AS worldName,
       character_class AS characterClass, character_level AS level, character_image AS image,
-      scheduler_json AS schedulerJson, scheduler_date AS schedulerDate
+      scheduler_json AS schedulerJson, scheduler_date AS schedulerDate,
+      boss380_hexa_score AS boss380HexaScore
     FROM characters WHERE google_sub = ? ORDER BY verified_at DESC
   `).bind(principal.sub).all<{
     nickname: string;
@@ -310,6 +311,7 @@ async function listCharacters(env: Env, principal: GooglePrincipal): Promise<Res
     image: string;
     schedulerJson: string;
     schedulerDate: string;
+    boss380HexaScore: number | null;
   }>();
   const characters = (result.results || []).map(({ schedulerJson, ...character }) => ({
     ...character,
@@ -367,40 +369,135 @@ async function listMultipliers(env: Env, groupId: string, principal: GooglePrinc
   return json({ multipliers: result.results || [] });
 }
 
-async function scrapeBossMultipliers(env: Env, nickname: string, bossIds: Set<string>): Promise<Map<string, number>> {
+type MapleScouterResult = {
+  multipliers: Map<string, number>;
+  boss380HexaScore: number | null;
+};
+
+async function scrapeMapleScouterResult(
+  page: import('@cloudflare/puppeteer').Page,
+  nickname: string,
+  bossIds: Set<string>,
+): Promise<MapleScouterResult> {
+  await page.goto(`https://maplescouter.com/ko/result?name=${encodeURIComponent(nickname)}`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 45_000,
+  });
+  await page.waitForSelector('img[src*="/bossIcon/"]', { timeout: 30_000 });
+  const scraped = await page.$$eval('img[src*="/bossIcon/"]', (images) => images.flatMap((image) => {
+    const src = image.getAttribute('src') || '';
+    const filename = new URL(src, location.origin).pathname.split('/').pop() || '';
+    const bossId = filename.replace(/\.[^.]+$/, '').trim().toLowerCase();
+    const card = image.closest('div.bg-surface-gray-surface-0');
+    const infoArea = card?.querySelector('div.relative.z-10');
+    const percentages = Array.from(infoArea?.children || []).flatMap((element) => (
+      (element.textContent || '').match(/\d+(?:\.\d+)?%/g) || []
+    ));
+    const multiplier = Number(percentages.at(-1)?.replace('%', ''));
+    return bossId && Number.isFinite(multiplier) ? [{ bossId, multiplier }] : [];
+  }));
+  const multipliers = new Map<string, number>();
+  for (const item of scraped) {
+    if (bossIds.has(item.bossId)) multipliers.set(item.bossId, item.multiplier);
+  }
+
+  const boss380HexaScore = await page.$$eval('div.bg-surface-gray-surface-0', (cards) => {
+    for (const card of cards) {
+      const badge = Array.from(card.querySelectorAll('span'))
+        .find((element) => element.textContent?.trim() === '보스380');
+      if (!badge) continue;
+
+      let section = badge.parentElement;
+      while (section && card.contains(section)) {
+        const hexaLabel = Array.from(section.querySelectorAll('span'))
+          .find((element) => element.textContent?.trim() === '헥사');
+        const value = hexaLabel && Array.from(hexaLabel.parentElement?.children || [])
+          .find((element) => element.tagName === 'SPAN' && element !== hexaLabel);
+        if (value) {
+          const score = Number((value.textContent || '').replace(/[^\d]/g, ''));
+          return Number.isSafeInteger(score) ? score : null;
+        }
+        section = section.parentElement;
+      }
+    }
+    return null;
+  });
+
+  return { multipliers, boss380HexaScore };
+}
+
+async function scrapeBossMultipliers(env: Env, nickname: string, bossIds: Set<string>): Promise<MapleScouterResult> {
   try {
     const { default: puppeteer } = await import('@cloudflare/puppeteer');
     const browser = await puppeteer.launch(env.BROWSER);
     try {
       const page = await browser.newPage();
       page.setDefaultNavigationTimeout(45_000);
-      await page.goto(`https://maplescouter.com/ko/result?name=${encodeURIComponent(nickname)}`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 45_000,
-      });
-      await page.waitForSelector('img[src*="/bossIcon/"]', { timeout: 30_000 });
-      const scraped = await page.$$eval('img[src*="/bossIcon/"]', (images) => images.flatMap((image) => {
-        const src = image.getAttribute('src') || '';
-        const filename = new URL(src, location.origin).pathname.split('/').pop() || '';
-        const bossId = filename.replace(/\.[^.]+$/, '').trim().toLowerCase();
-        const card = image.closest('div.bg-surface-gray-surface-0');
-        const infoArea = card?.querySelector('div.relative.z-10');
-        const percentages = Array.from(infoArea?.children || []).flatMap((element) => (
-          (element.textContent || '').match(/\d+(?:\.\d+)?%/g) || []
-        ));
-        const multiplier = Number(percentages.at(-1)?.replace('%', ''));
-        return bossId && Number.isFinite(multiplier) ? [{ bossId, multiplier }] : [];
-      }));
-      const multipliers = new Map<string, number>();
-      for (const item of scraped) {
-        if (bossIds.has(item.bossId)) multipliers.set(item.bossId, item.multiplier);
-      }
-      return multipliers;
+      return await scrapeMapleScouterResult(page, nickname, bossIds);
     } finally {
       await browser.close().catch(() => undefined);
     }
   } catch {
     throw new ApiError(502, 'MapleScouter에서 보스별 배율을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
+  }
+}
+
+async function refreshCharacterScores(
+  env: Env,
+  principal: GooglePrincipal,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  if (Object.keys(body).length) throw new ApiError(400, '요청 본문은 비워야 합니다.');
+  const characters = await env.DB.prepare(`
+    SELECT nickname FROM characters WHERE google_sub = ? ORDER BY nickname COLLATE NOCASE
+  `).bind(principal.sub).all<{ nickname: string }>();
+  const nicknames = characters.results || [];
+  if (!nicknames.length) return json({ scores: [], refreshedCount: 0, unavailableCount: 0 });
+
+  let puppeteer;
+  try {
+    ({ default: puppeteer } = await import('@cloudflare/puppeteer'));
+  } catch {
+    throw new ApiError(502, 'MapleScouter 점수를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
+  }
+
+  let browser;
+  try {
+    browser = await puppeteer.launch(env.BROWSER);
+  } catch {
+    throw new ApiError(502, 'MapleScouter 점수를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
+  }
+  try {
+    const page = await browser.newPage();
+    page.setDefaultNavigationTimeout(45_000);
+
+    let refreshedCount = 0;
+    let unavailableCount = 0;
+    for (const { nickname } of nicknames) {
+      let boss380HexaScore: number | null;
+      try {
+        ({ boss380HexaScore } = await scrapeMapleScouterResult(page, nickname, new Set()));
+      } catch {
+        unavailableCount += 1;
+        continue;
+      }
+      if (boss380HexaScore === null) {
+        unavailableCount += 1;
+        continue;
+      }
+      await env.DB.prepare(`
+        UPDATE characters SET boss380_hexa_score = ?
+        WHERE google_sub = ? AND lower(nickname) = lower(?)
+      `).bind(boss380HexaScore, principal.sub, nickname).run();
+      refreshedCount += 1;
+    }
+    const scores = await env.DB.prepare(`
+      SELECT nickname, boss380_hexa_score AS boss380HexaScore
+      FROM characters WHERE google_sub = ? ORDER BY nickname COLLATE NOCASE
+    `).bind(principal.sub).all<{ nickname: string; boss380HexaScore: number | null }>();
+    return json({ scores: scores.results || [], refreshedCount, unavailableCount });
+  } finally {
+    await browser.close().catch(() => undefined);
   }
 }
 
@@ -417,11 +514,17 @@ async function updateMultipliers(env: Env, groupId: string, principal: GooglePri
 
   const bossIds = new Set((await getBossIds(env, group.id)).map((bossId) => bossId.toLowerCase()));
   if (!bossIds.size) throw new ApiError(400, '그룹에 등록된 보스가 없습니다. 먼저 보스를 등록해 주세요.');
-  const incoming = await scrapeBossMultipliers(env, nickname, bossIds);
-  if (!incoming.size) throw new ApiError(502, 'MapleScouter 결과에서 그룹에 등록된 보스 배율을 찾지 못했습니다.');
+  const scraped = await scrapeBossMultipliers(env, nickname, bossIds);
+  if (scraped.boss380HexaScore !== null) {
+    await env.DB.prepare(`
+      UPDATE characters SET boss380_hexa_score = ?
+      WHERE google_sub = ? AND lower(nickname) = lower(?)
+    `).bind(scraped.boss380HexaScore, principal.sub, nickname).run();
+  }
+  if (!scraped.multipliers.size) throw new ApiError(502, 'MapleScouter 결과에서 그룹에 등록된 보스 배율을 찾지 못했습니다.');
 
   const updatedAt = new Date().toISOString();
-  await env.DB.batch([...incoming].map(([bossId, multiplier]) => env.DB.prepare(`
+  await env.DB.batch([...scraped.multipliers].map(([bossId, multiplier]) => env.DB.prepare(`
     INSERT INTO multipliers (group_id, nickname, boss_id, multiplier, updated_at, updated_by)
     VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT (group_id, nickname, boss_id) DO UPDATE SET
@@ -429,7 +532,12 @@ async function updateMultipliers(env: Env, groupId: string, principal: GooglePri
       updated_at = excluded.updated_at,
       updated_by = excluded.updated_by
   `).bind(group.id, nickname, bossId, multiplier, updatedAt, principal.email)));
-  return json({ nickname, updated: incoming.size, updatedAt });
+  return json({
+    nickname,
+    updated: scraped.multipliers.size,
+    updatedAt,
+    boss380HexaScore: scraped.boss380HexaScore,
+  });
 }
 
 async function route(request: Request, env: Env): Promise<Response> {
@@ -441,6 +549,9 @@ async function route(request: Request, env: Env): Promise<Response> {
   const principal = await authenticate(request);
   if (request.method === 'GET' && path.length === 2 && path[1] === 'groups') return listGroups(env, principal);
   if (request.method === 'GET' && path.length === 2 && path[1] === 'characters') return listCharacters(env, principal);
+  if (request.method === 'POST' && path.length === 3 && path[1] === 'characters' && path[2] === 'maplescouter-scores') {
+    return refreshCharacterScores(env, principal, await readBody(request));
+  }
   if (request.method === 'POST' && path.length === 2 && path[1] === 'groups') {
     return createGroup(env, principal, await readBody(request));
   }

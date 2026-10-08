@@ -81,6 +81,7 @@ env -u GITHUB_TOKEN git push origin main
 | `GET` | `/api/health` | 공개 상태 확인 |
 | `POST` | `/api/characters/verify` | API 키 계정의 전체 캐릭터, 기본 정보, 스케줄러 현황 동기화 |
 | `GET` | `/api/characters` | 로그인 사용자의 캐릭터 및 저장된 스케줄러 현황 조회 |
+| `POST` | `/api/characters/maplescouter-scores` | 로그인 사용자의 캐릭터 보스380 헥사환산 점수를 MapleScouter에서 갱신 |
 | `GET` | `/api/groups` | 로그인 사용자가 속한 그룹 목록 |
 | `POST` | `/api/groups` | D1에 그룹 생성, 요청 사용자를 관리자 지정 |
 | `POST` | `/api/groups/:id/members` | 그룹 관리자가 이메일 멤버 추가 |
@@ -91,6 +92,8 @@ env -u GITHUB_TOKEN git push origin main
 | `POST` | `/api/groups/:id/multipliers` | 인증된 캐릭터의 MapleScouter 배율을 크롤링해 D1에 upsert |
 
 캐릭터 동기화 요청에는 Nexon API 키만 전달합니다. Worker는 캐릭터 목록에서 260레벨 이상인 캐릭터만 기본 정보와 스케줄러 현황을 조회해 Google 계정에 연결하고, API 키는 저장하지 않습니다. Nexon API 요청은 동기화 요청 안에서 초당 최대 5회가 되도록 간격을 두고 전송합니다. 기본 정보 조회에 실패한 캐릭터는 해당 동기화에서 건너뛰지만, 이미 저장된 캐릭터 정보는 삭제하지 않습니다. 스케줄러 조회에 실패해도 기본 정보가 있는 캐릭터는 등록하며, 스케줄 정보만 비워 둡니다. 캐릭터 기본 정보는 별도 조회 기준일 없이 가져오며, 스케줄러는 Nexon API의 `/maplestory/v1/scheduler/character-state` 응답을 사용합니다. 최신 현황이 필요하면 API 키를 다시 입력해 동기화합니다.
+
+캐릭터 화면은 별도 MapleScouter 점수 갱신 요청으로 각 캐릭터의 `보스380` 헥사환산 점수를 가져와 D1에 저장합니다. 이 점수는 `/api/characters` 응답에 포함되며, MapleScouter 결과가 아직 없거나 조회되지 않은 캐릭터는 `null`로 반환됩니다. 기존 D1에는 `0005_character_boss380_hexa_score.sql` 마이그레이션을 적용해야 합니다.
 
 ```json
 {
