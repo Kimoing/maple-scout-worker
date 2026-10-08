@@ -215,16 +215,16 @@ test('associates every character from the Nexon API key with the Google account'
     }
     if (url.pathname.endsWith('/id')) {
       const nickname = url.searchParams.get('character_name');
-      assert.ok(['first-character', 'second-character'].includes(nickname));
+      assert.equal(nickname, 'second-character');
       return Response.json({ ocid: `resolved-${nickname}` });
     }
     if (url.pathname.endsWith('/character/basic')) {
       assert.equal(url.searchParams.has('date'), false);
-      assert.ok(['resolved-first-character', 'resolved-second-character'].includes(url.searchParams.get('ocid')));
+      assert.ok(['ocid-1', 'resolved-second-character'].includes(url.searchParams.get('ocid')));
       return Response.json({
         world_name: 'Scania',
         character_class: 'Hero',
-        character_level: url.searchParams.get('ocid') === 'resolved-first-character' ? 280 : 260,
+        character_level: url.searchParams.get('ocid') === 'ocid-1' ? 280 : 260,
         character_image: `https://image.example.test/${url.searchParams.get('ocid')}.png`,
       });
     }
@@ -251,11 +251,11 @@ test('associates every character from the Nexon API key with the Google account'
     assert.deepEqual(result.characters, [
       {
         nickname: 'first-character',
-        ocid: 'resolved-first-character',
+        ocid: 'ocid-1',
         worldName: 'Scania',
         characterClass: 'Hero',
         level: 280,
-        image: 'https://image.example.test/resolved-first-character.png',
+        image: 'https://image.example.test/ocid-1.png',
         scheduler: {
           date: '2026-10-08',
           daily_contents: [{ content_name: 'Daily Quest', now_count: 1, max_count: 3 }],
@@ -280,11 +280,11 @@ test('associates every character from the Nexon API key with the Google account'
     ]);
     assert.equal(result.verified, true);
     assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/character/list').length, 1);
-    assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/id').length, 2);
+    assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/id').length, 1);
     assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/character/basic').length, 2);
     assert.equal(requestedPaths.filter((path) => path === '/maplestory/v1/scheduler/character-state').length, 2);
     assert.deepEqual(insertedStatements.map(({ values }) => values.slice(0, 3)), [
-      ['google-subject', 'first-character', 'resolved-first-character'],
+      ['google-subject', 'first-character', 'ocid-1'],
       ['google-subject', 'second-character', 'resolved-second-character'],
     ]);
     assert.equal(JSON.parse(insertedStatements[0].values[8]).date, '2026-10-08');

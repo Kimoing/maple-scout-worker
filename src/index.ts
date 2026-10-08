@@ -160,15 +160,18 @@ async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Recor
   const skippedCharacters: string[] = [];
   const schedulerUnavailable: string[] = [];
   for (let offset = 0; offset < listedCharacters.length; offset += 3) {
-    const batch = await Promise.allSettled(listedCharacters.slice(offset, offset + 3).map(async ({ nickname }) => {
-      const idUrl = new URL('https://open.api.nexon.com/maplestory/v1/id');
-      idUrl.searchParams.set('character_name', nickname);
-      const idResponse = await fetch(idUrl, { headers });
-      if (!idResponse.ok) {
-        throw new ApiError(502, `${nickname} 캐릭터 OCID 조회 실패: ${await nexonError(idResponse)}`);
+    const batch = await Promise.allSettled(listedCharacters.slice(offset, offset + 3).map(async ({ nickname, ocid: listedOcid }) => {
+      let ocid = listedOcid;
+      if (!ocid) {
+        const idUrl = new URL('https://open.api.nexon.com/maplestory/v1/id');
+        idUrl.searchParams.set('character_name', nickname);
+        const idResponse = await fetch(idUrl, { headers });
+        if (!idResponse.ok) {
+          throw new ApiError(502, `${nickname} 캐릭터 OCID 조회 실패: ${await nexonError(idResponse)}`);
+        }
+        const idResult = await idResponse.json() as { ocid?: string };
+        ocid = typeof idResult.ocid === 'string' ? idResult.ocid.trim() : '';
       }
-      const idResult = await idResponse.json() as { ocid?: string };
-      const ocid = typeof idResult.ocid === 'string' ? idResult.ocid.trim() : '';
       if (!ocid) throw new ApiError(502, `${nickname} 캐릭터 OCID를 Nexon API 응답에서 찾을 수 없습니다.`);
 
       const basicUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/basic');
