@@ -142,9 +142,10 @@ test('adds a group boss to D1', async () => {
   }
 });
 
-test('rejects a character missing from the Nexon API key account list', async () => {
+test('rejects an invalid Nexon API key before database writes', async () => {
   const originalFetch = globalThis.fetch;
   const originalPrepare = env.DB.prepare;
+  const originalBatch = env.DB.batch;
   const requestedPaths = [];
   let databaseWrites = 0;
   globalThis.fetch = async (input) => {
@@ -157,14 +158,13 @@ test('rejects a character missing from the Nexon API key account list', async ()
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     requestedPaths.push(url.pathname);
-    return new Response(JSON.stringify({
-      account_list: [{ character_list: [{ character_name: 'different-character' }] }],
-    }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(JSON.stringify({ error: { message: 'Invalid API key' } }), { status: 403 });
   };
   env.DB.prepare = () => {
+    databaseWrites += 1;
+    throw new Error('Unexpected database access');
+  };
+  env.DB.batch = async () => {
     databaseWrites += 1;
     throw new Error('Unexpected database access');
   };
@@ -172,25 +172,25 @@ test('rejects a character missing from the Nexon API key account list', async ()
     const response = await worker.fetch(new Request('https://worker.example.test/api/characters/verify', {
       method: 'POST',
       headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nickname: 'not-owned-character', apiKey: 'nexon-key' }),
+      body: JSON.stringify({ apiKey: 'invalid-key' }),
     }), env);
     assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), {
-      error: '입력한 닉네임이 Nexon API 키 계정의 캐릭터 목록에 없습니다.',
-    });
+    assert.deepEqual(await response.json(), { error: 'Nexon API 키를 확인할 수 없습니다.' });
     assert.deepEqual(requestedPaths, ['/maplestory/v1/character/list']);
     assert.equal(databaseWrites, 0);
   } finally {
     globalThis.fetch = originalFetch;
     env.DB.prepare = originalPrepare;
+    env.DB.batch = originalBatch;
   }
 });
 
-test('verifies and stores a character present in the Nexon API key account list', async () => {
+test('associates every character from the Nexon API key with the Google account', async () => {
   const originalFetch = globalThis.fetch;
   const originalPrepare = env.DB.prepare;
+  const originalBatch = env.DB.batch;
   const requestedPaths = [];
-  let insertedValues;
+  let insertedStatements;
   globalThis.fetch = async (input, options) => {
     const url = new URL(input);
     if (url.hostname === 'openidconnect.googleapis.com') {
@@ -203,50 +203,42 @@ test('verifies and stores a character present in the Nexon API key account list'
     requestedPaths.push(url.pathname);
     assert.equal(new Headers(options.headers).get('x-nxopen-api-key'), 'nexon-key');
     if (url.pathname.endsWith('/character/list')) {
-      assert.equal(url.searchParams.has('date'), false);
       return new Response(JSON.stringify({
-        account_list: [{ character_list: [{ character_name: 'verified-character' }] }],
+        account_list: [
+          { account_id: 'account-1', character_list: [{ ocid: 'ocid-1', character_name: 'first-character' }] },
+          { account_id: 'account-2', character_list: [{ ocid: 'ocid-2', character_name: 'second-character' }] },
+        ],
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
     }
-    if (url.pathname.endsWith('/id')) {
-      return new Response(JSON.stringify({ ocid: 'character-ocid' }), { status: 200 });
-    }
-    return new Response(JSON.stringify({ character_name: 'verified-character' }), { status: 200 });
+    throw new Error(`Unexpected Nexon API request: ${url.pathname}`);
   };
-  env.DB.prepare = (query) => ({
-    bind: (...values) => ({
-      run: async () => {
-        assert.match(query, /INSERT INTO characters/);
-        insertedValues = values;
-        return { success: true };
-      },
-    }),
-  });
+  env.DB.prepare = (query) => ({ bind: (...values) => ({ query, values }) });
+  env.DB.batch = async (statements) => { insertedStatements = statements; };
   try {
     const response = await worker.fetch(new Request('https://worker.example.test/api/characters/verify', {
       method: 'POST',
       headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nickname: 'verified-character', apiKey: 'nexon-key' }),
+      body: JSON.stringify({ apiKey: 'nexon-key' }),
     }), env);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), {
-      nickname: 'verified-character',
-      ocid: 'character-ocid',
+      characters: [
+        { nickname: 'first-character', ocid: 'ocid-1' },
+        { nickname: 'second-character', ocid: 'ocid-2' },
+      ],
       verified: true,
     });
-    assert.deepEqual(requestedPaths, [
-      '/maplestory/v1/character/list',
-      '/maplestory/v1/id',
-      '/maplestory/v1/character/basic',
+    assert.deepEqual(requestedPaths, ['/maplestory/v1/character/list']);
+    assert.deepEqual(insertedStatements.map(({ values }) => values.slice(0, 3)), [
+      ['google-subject', 'first-character', 'ocid-1'],
+      ['google-subject', 'second-character', 'ocid-2'],
     ]);
-    assert.equal(insertedValues[0], 'google-subject');
-    assert.equal(insertedValues[1], 'verified-character');
-    assert.equal(insertedValues[2], 'character-ocid');
   } finally {
     globalThis.fetch = originalFetch;
     env.DB.prepare = originalPrepare;
+    env.DB.batch = originalBatch;
   }
 });

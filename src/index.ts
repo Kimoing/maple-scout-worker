@@ -115,44 +115,36 @@ async function getBossIds(env: Env, groupId: string): Promise<string[]> {
 }
 
 async function verifyCharacter(env: Env, principal: GooglePrincipal, body: Record<string, unknown>): Promise<Response> {
-  const nickname = stringField(body, 'nickname', 24);
   const apiKey = stringField(body, 'apiKey', 256);
   const headers = { 'x-nxopen-api-key': apiKey };
-  const date = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
   const listUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/list');
   const listResponse = await fetch(listUrl, { headers });
+  if (!listResponse.ok) throw new ApiError(400, 'Nexon API 키를 확인할 수 없습니다.');
   const listResult = await listResponse.json().catch(() => ({})) as {
-    account_list?: Array<{ character_list?: Array<{ character_name?: string }> }>;
+    account_list?: Array<{
+      character_list?: Array<{ ocid?: string; character_name?: string }>;
+    }>;
   };
-  const ownsCharacter = listResult.account_list?.some((account) => (
-    account.character_list?.some((character) => character.character_name === nickname)
-  ));
-  if (!listResponse.ok || !ownsCharacter) {
-    throw new ApiError(400, '입력한 닉네임이 Nexon API 키 계정의 캐릭터 목록에 없습니다.');
-  }
+  const characters = [...new Map((listResult.account_list || [])
+    .flatMap((account) => account.character_list || [])
+    .flatMap((character) => {
+      const nickname = typeof character.character_name === 'string' ? character.character_name.trim() : '';
+      const ocid = typeof character.ocid === 'string' ? character.ocid.trim() : '';
+      return nickname && nickname.length <= 24 && ocid ? [[ocid, { nickname, ocid }]] : [];
+    })).values()];
+  if (!characters.length) throw new ApiError(400, 'Nexon API 키 계정에서 캐릭터 목록을 찾을 수 없습니다.');
 
-  const idUrl = new URL('https://open.api.nexon.com/maplestory/v1/id');
-  idUrl.searchParams.set('character_name', nickname);
-  const idResponse = await fetch(idUrl, { headers });
-  const idResult = await idResponse.json().catch(() => ({})) as { ocid?: string };
-  if (!idResponse.ok || !idResult.ocid) throw new ApiError(400, 'Nexon API 키 또는 캐릭터 닉네임을 확인할 수 없습니다.');
-
-  const basicUrl = new URL('https://open.api.nexon.com/maplestory/v1/character/basic');
-  basicUrl.searchParams.set('ocid', idResult.ocid);
-  basicUrl.searchParams.set('date', date);
-  const basicResponse = await fetch(basicUrl, { headers });
-  const basicResult = await basicResponse.json().catch(() => ({})) as { character_name?: string };
-  if (!basicResponse.ok || basicResult.character_name !== nickname) {
-    throw new ApiError(400, '입력한 닉네임과 Nexon API에서 확인한 캐릭터가 일치하지 않습니다.');
-  }
-
-  await env.DB.prepare(`
+  const verifiedAt = new Date().toISOString();
+  const statements = characters.map(({ nickname, ocid }) => env.DB.prepare(`
     INSERT INTO characters (google_sub, nickname, ocid, verified_at)
     VALUES (?, ?, ?, ?)
     ON CONFLICT (google_sub, nickname) DO UPDATE SET ocid = excluded.ocid, verified_at = excluded.verified_at
-  `).bind(principal.sub, nickname, idResult.ocid, new Date().toISOString()).run();
+  `).bind(principal.sub, nickname, ocid, verifiedAt));
+  for (let offset = 0; offset < statements.length; offset += 100) {
+    await env.DB.batch(statements.slice(offset, offset + 100));
+  }
 
-  return json({ nickname, ocid: idResult.ocid, verified: true });
+  return json({ characters, verified: true });
 }
 
 async function createGroup(env: Env, principal: GooglePrincipal, body: Record<string, unknown>): Promise<Response> {

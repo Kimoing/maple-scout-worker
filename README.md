@@ -78,7 +78,7 @@ env -u GITHUB_TOKEN git push origin main
 | Method | Route | 기능 |
 | --- | --- | --- |
 | `GET` | `/api/health` | 공개 상태 확인 |
-| `POST` | `/api/characters/verify` | Nexon API로 캐릭터를 확인하고 Google 계정에 연결 |
+| `POST` | `/api/characters/verify` | Nexon API 키 계정의 전체 캐릭터를 Google 계정에 연결 |
 | `GET` | `/api/characters` | 로그인 사용자의 인증 캐릭터 목록 |
 | `GET` | `/api/groups` | 로그인 사용자가 속한 그룹 목록 |
 | `POST` | `/api/groups` | D1에 그룹 생성, 요청 사용자를 관리자 지정 |
@@ -88,6 +88,14 @@ env -u GITHUB_TOKEN git push origin main
 | `POST` | `/api/groups/:id/bosses` | 관리자가 D1에 bossId 추가 |
 | `GET` | `/api/groups/:id/multipliers` | 그룹 배율을 D1에서 조회 |
 | `POST` | `/api/groups/:id/multipliers` | 인증된 캐릭터의 MapleScouter 배율을 크롤링해 D1에 upsert |
+
+캐릭터 연결 요청에는 Nexon API 키만 전달합니다. Worker는 응답에 포함된 모든 캐릭터를 Google 계정에 연결하고, API 키는 저장하지 않습니다.
+
+```json
+{
+  "apiKey": "NEXON_OPEN_API_KEY"
+}
+```
 
 배율 새로고침 요청 예시:
 
