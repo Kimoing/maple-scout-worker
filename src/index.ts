@@ -1,8 +1,5 @@
-import type { BrowserWorker } from '@cloudflare/puppeteer';
-
 interface Env {
   DB: D1Database;
-  BROWSER: BrowserWorker;
   APP_ORIGINS: string;
 }
 
@@ -369,188 +366,94 @@ async function listMultipliers(env: Env, groupId: string, principal: GooglePrinc
   return json({ multipliers: result.results || [] });
 }
 
-type MapleScouterResult = {
-  multipliers: Map<string, number>;
-  boss380HexaScore: number | null;
-};
-
-function logMapleScouterSetupFailure(stage: string, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error('MapleScouter browser setup failed', {
-    stage,
-    errorName: error instanceof Error ? error.name : 'UnknownError',
-    message: message.replace(/https?:\/\/\S+/g, '[url]').slice(0, 300),
-  });
-}
-
-export async function scrapeMapleScouterResult(
-  page: import('@cloudflare/puppeteer').Page,
-  nickname: string,
-  bossIds: Set<string>,
-): Promise<MapleScouterResult> {
-  await page.goto(`https://maplescouter.com/ko/result?name=${encodeURIComponent(nickname)}`, {
-    waitUntil: 'domcontentloaded',
-    timeout: 45_000,
-  });
-  await page.waitForSelector('img[src*="/bossIcon/"]', { timeout: 30_000 });
-  const scraped = await page.$$eval('div.bg-surface-gray-surface-0', (cards) => {
-    const multipliers = Array.from(document.querySelectorAll('img[src*="/bossIcon/"]')).flatMap((image) => {
-      const src = image.getAttribute('src') || '';
-      const filename = new URL(src, location.origin).pathname.split('/').pop() || '';
-      const bossId = filename.replace(/\.[^.]+$/, '').trim().toLowerCase();
-      const card = image.closest('div.bg-surface-gray-surface-0');
-      const infoArea = card?.querySelector('div.relative.z-10');
-      const percentages = Array.from(infoArea?.children || []).flatMap((element) => (
-        (element.textContent || '').match(/\d+(?:\.\d+)?%/g) || []
-      ));
-      const multiplier = Number(percentages.at(-1)?.replace('%', ''));
-      return bossId && Number.isFinite(multiplier) ? [{ bossId, multiplier }] : [];
-    });
-
-    let boss380HexaScore: number | null = null;
-    for (const card of cards) {
-      const badge = Array.from(card.querySelectorAll('span'))
-        .find((element) => element.textContent?.trim() === '보스380');
-      if (!badge) continue;
-
-      let section = badge.parentElement;
-      while (section && card.contains(section)) {
-        const hexaLabel = Array.from(section.querySelectorAll('span'))
-          .find((element) => element.textContent?.trim() === '헥사');
-        const value = hexaLabel && Array.from(hexaLabel.parentElement?.children || [])
-          .find((element) => element.tagName === 'SPAN' && element !== hexaLabel);
-        if (value) {
-          const score = Number((value.textContent || '').replace(/[^\d]/g, ''));
-          boss380HexaScore = Number.isSafeInteger(score) ? score : null;
-          break;
-        }
-        section = section.parentElement;
-      }
-      break;
-    }
-
-    return { multipliers, boss380HexaScore };
-  });
-  const multipliers = new Map<string, number>();
-  for (const item of scraped.multipliers) {
-    if (bossIds.has(item.bossId)) multipliers.set(item.bossId, item.multiplier);
-  }
-  return { multipliers, boss380HexaScore: scraped.boss380HexaScore };
-}
-
-async function scrapeBossMultipliers(env: Env, nickname: string, bossIds: Set<string>): Promise<MapleScouterResult> {
-  try {
-    const { default: puppeteer } = await import('@cloudflare/puppeteer');
-    const browser = await puppeteer.launch(env.BROWSER);
-    try {
-      const page = await browser.newPage();
-      page.setDefaultNavigationTimeout(45_000);
-      return await scrapeMapleScouterResult(page, nickname, bossIds);
-    } finally {
-      await browser.close().catch(() => undefined);
-    }
-  } catch {
-    throw new ApiError(502, 'MapleScouter에서 보스별 배율을 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
-  }
-}
-
-async function refreshCharacterScores(
+async function importMapleScouterData(
   env: Env,
   principal: GooglePrincipal,
   body: Record<string, unknown>,
 ): Promise<Response> {
-  if (Object.keys(body).length) throw new ApiError(400, '요청 본문은 비워야 합니다.');
-  const characters = await env.DB.prepare(`
-    SELECT nickname FROM characters WHERE google_sub = ? ORDER BY nickname COLLATE NOCASE
-  `).bind(principal.sub).all<{ nickname: string }>();
-  const nicknames = characters.results || [];
-  if (!nicknames.length) return json({ scores: [], refreshedCount: 0, unavailableCount: 0 });
-
-  let puppeteer;
-  try {
-    ({ default: puppeteer } = await import('@cloudflare/puppeteer'));
-  } catch (error) {
-    logMapleScouterSetupFailure('import', error);
-    throw new ApiError(502, 'MapleScouter 점수를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
+  const allowedFields = new Set(['nickname', 'boss380HexaScore', 'multipliers', 'groupId']);
+  if (Object.keys(body).some((key) => !allowedFields.has(key))) {
+    throw new ApiError(400, 'MapleScouter 가져오기 요청 항목을 확인해 주세요.');
   }
 
-  let browser;
-  try {
-    browser = await puppeteer.launch(env.BROWSER);
-  } catch (error) {
-    logMapleScouterSetupFailure('launch', error);
-    throw new ApiError(502, 'MapleScouter 점수를 가져오지 못했습니다. 잠시 후 다시 시도해 주세요.');
-  }
-  try {
-    const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(45_000);
-
-    let refreshedCount = 0;
-    let unavailableCount = 0;
-    for (const { nickname } of nicknames) {
-      let boss380HexaScore: number | null;
-      try {
-        ({ boss380HexaScore } = await scrapeMapleScouterResult(page, nickname, new Set()));
-      } catch {
-        unavailableCount += 1;
-        continue;
-      }
-      if (boss380HexaScore === null) {
-        unavailableCount += 1;
-        continue;
-      }
-      await env.DB.prepare(`
-        UPDATE characters SET boss380_hexa_score = ?
-        WHERE google_sub = ? AND lower(nickname) = lower(?)
-      `).bind(boss380HexaScore, principal.sub, nickname).run();
-      refreshedCount += 1;
-    }
-    const scores = await env.DB.prepare(`
-      SELECT nickname, boss380_hexa_score AS boss380HexaScore
-      FROM characters WHERE google_sub = ? ORDER BY nickname COLLATE NOCASE
-    `).bind(principal.sub).all<{ nickname: string; boss380HexaScore: number | null }>();
-    return json({ scores: scores.results || [], refreshedCount, unavailableCount });
-  } finally {
-    await browser.close().catch(() => undefined);
-  }
-}
-
-async function updateMultipliers(env: Env, groupId: string, principal: GooglePrincipal, body: Record<string, unknown>): Promise<Response> {
-  const group = await getGroup(env, groupId, principal.email);
-  if (Object.keys(body).some((key) => key !== 'nickname')) {
-    throw new ApiError(400, 'nickname만 요청할 수 있습니다.');
-  }
   const nickname = stringField(body, 'nickname', 24);
+  const boss380HexaScore = body.boss380HexaScore;
+  if (typeof boss380HexaScore !== 'number' || !Number.isSafeInteger(boss380HexaScore)
+    || boss380HexaScore < 0 || boss380HexaScore > 100_000_000) {
+    throw new ApiError(400, '보스380 헥사환산 점수 형식이 올바르지 않습니다.');
+  }
+
+  const rawMultipliers = body.multipliers === undefined ? [] : body.multipliers;
+  if (!Array.isArray(rawMultipliers) || rawMultipliers.length > 100) {
+    throw new ApiError(400, '보스 배율 목록 형식이 올바르지 않습니다.');
+  }
+  const seenBossIds = new Set<string>();
+  const importedMultipliers = rawMultipliers.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new ApiError(400, '보스 배율 항목 형식이 올바르지 않습니다.');
+    }
+    const multiplierEntry = entry as Record<string, unknown>;
+    if (Object.keys(multiplierEntry).some((key) => key !== 'bossId' && key !== 'multiplier')) {
+      throw new ApiError(400, '보스 배율 항목은 bossId와 multiplier만 포함할 수 있습니다.');
+    }
+    const bossId = stringField(multiplierEntry, 'bossId', 80).toLowerCase();
+    const multiplier = multiplierEntry.multiplier;
+    if (!bossIdPattern.test(bossId) || typeof multiplier !== 'number'
+      || !Number.isFinite(multiplier) || multiplier < 0 || multiplier > 1000) {
+      throw new ApiError(400, '보스 ID 또는 배율 값이 올바르지 않습니다.');
+    }
+    if (seenBossIds.has(bossId)) throw new ApiError(400, '중복된 보스 배율이 있습니다.');
+    seenBossIds.add(bossId);
+    return { bossId, multiplier };
+  });
+
+  let groupId: string | null = null;
+  if (body.groupId !== undefined && body.groupId !== null && body.groupId !== '') {
+    if (typeof body.groupId !== 'string') throw new ApiError(400, 'groupId 형식이 올바르지 않습니다.');
+    groupId = stringField(body, 'groupId', 80);
+  }
+  if (importedMultipliers.length && !groupId) {
+    throw new ApiError(400, '보스 배율을 저장할 그룹을 선택해 주세요.');
+  }
+
   const character = await env.DB.prepare(`
-    SELECT ocid FROM characters WHERE google_sub = ? AND lower(nickname) = lower(?)
-  `).bind(principal.sub, nickname).first<{ ocid: string }>();
+    SELECT nickname FROM characters WHERE google_sub = ? AND lower(nickname) = lower(?)
+  `).bind(principal.sub, nickname).first<{ nickname: string }>();
   if (!character) throw new ApiError(403, '이 Google 계정으로 인증한 캐릭터가 아닙니다.');
 
-  const bossIds = new Set((await getBossIds(env, group.id)).map((bossId) => bossId.toLowerCase()));
-  if (!bossIds.size) throw new ApiError(400, '그룹에 등록된 보스가 없습니다. 먼저 보스를 등록해 주세요.');
-  const scraped = await scrapeBossMultipliers(env, nickname, bossIds);
-  if (scraped.boss380HexaScore !== null) {
-    await env.DB.prepare(`
-      UPDATE characters SET boss380_hexa_score = ?
-      WHERE google_sub = ? AND lower(nickname) = lower(?)
-    `).bind(scraped.boss380HexaScore, principal.sub, nickname).run();
+  let acceptedMultipliers = importedMultipliers;
+  if (groupId) {
+    const group = await getGroup(env, groupId, principal.email);
+    const groupBossIds = new Set((await getBossIds(env, group.id)).map((bossId) => bossId.toLowerCase()));
+    acceptedMultipliers = importedMultipliers.filter(({ bossId }) => groupBossIds.has(bossId));
+    if (importedMultipliers.length && !acceptedMultipliers.length) {
+      throw new ApiError(400, '가져온 보스와 일치하는 그룹 등록 보스가 없습니다.');
+    }
   }
-  if (!scraped.multipliers.size) throw new ApiError(502, 'MapleScouter 결과에서 그룹에 등록된 보스 배율을 찾지 못했습니다.');
 
   const updatedAt = new Date().toISOString();
-  await env.DB.batch([...scraped.multipliers].map(([bossId, multiplier]) => env.DB.prepare(`
-    INSERT INTO multipliers (group_id, nickname, boss_id, multiplier, updated_at, updated_by)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT (group_id, nickname, boss_id) DO UPDATE SET
-      multiplier = excluded.multiplier,
-      updated_at = excluded.updated_at,
-      updated_by = excluded.updated_by
-  `).bind(group.id, nickname, bossId, multiplier, updatedAt, principal.email)));
+  const statements = [env.DB.prepare(`
+    UPDATE characters SET boss380_hexa_score = ?
+    WHERE google_sub = ? AND lower(nickname) = lower(?)
+  `).bind(boss380HexaScore, principal.sub, character.nickname)];
+  if (groupId && acceptedMultipliers.length) {
+    statements.push(...acceptedMultipliers.map(({ bossId, multiplier }) => env.DB.prepare(`
+      INSERT INTO multipliers (group_id, nickname, boss_id, multiplier, updated_at, updated_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (group_id, nickname, boss_id) DO UPDATE SET
+        multiplier = excluded.multiplier,
+        updated_at = excluded.updated_at,
+        updated_by = excluded.updated_by
+    `).bind(groupId, character.nickname, bossId, multiplier, updatedAt, principal.email)));
+  }
+  await env.DB.batch(statements);
+
   return json({
-    nickname,
-    updated: scraped.multipliers.size,
+    nickname: character.nickname,
+    boss380HexaScore,
+    updatedMultipliers: acceptedMultipliers.length,
+    ignoredMultipliers: importedMultipliers.length - acceptedMultipliers.length,
     updatedAt,
-    boss380HexaScore: scraped.boss380HexaScore,
   });
 }
 
@@ -564,7 +467,10 @@ async function route(request: Request, env: Env): Promise<Response> {
   if (request.method === 'GET' && path.length === 2 && path[1] === 'groups') return listGroups(env, principal);
   if (request.method === 'GET' && path.length === 2 && path[1] === 'characters') return listCharacters(env, principal);
   if (request.method === 'POST' && path.length === 3 && path[1] === 'characters' && path[2] === 'maplescouter-scores') {
-    return refreshCharacterScores(env, principal, await readBody(request));
+    throw new ApiError(410, 'MapleScouter 점수는 로그인 앱의 브라우저 가져오기로 저장해 주세요.');
+  }
+  if (request.method === 'POST' && path.length === 3 && path[1] === 'characters' && path[2] === 'maplescouter-import') {
+    return importMapleScouterData(env, principal, await readBody(request));
   }
   if (request.method === 'POST' && path.length === 2 && path[1] === 'groups') {
     return createGroup(env, principal, await readBody(request));
@@ -590,7 +496,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       return listMultipliers(env, groupId, principal);
     }
     if (path.length === 4 && path[3] === 'multipliers' && request.method === 'POST') {
-      return updateMultipliers(env, groupId, principal, await readBody(request));
+      throw new ApiError(410, '보스 배율은 로그인 앱의 브라우저 가져오기로 저장해 주세요.');
     }
   }
   throw new ApiError(404, '요청한 API를 찾을 수 없습니다.');

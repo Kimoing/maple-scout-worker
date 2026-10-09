@@ -9,57 +9,10 @@ const compiled = ts.transpileModule(source, {
 }).outputText;
 const workerModule = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 const worker = workerModule.default;
-const { scrapeMapleScouterResult } = workerModule;
 const env = {
   DB: {},
   APP_ORIGINS: 'https://app.example.test,http://localhost:3000',
 };
-
-test('scrapes boss multipliers and Boss 380 hexa score together after boss icons load', async () => {
-  const badge = { textContent: '보스380' };
-  const hexaLabel = { tagName: 'SPAN', textContent: '헥사' };
-  const scoreValue = { tagName: 'SPAN', textContent: '67,619' };
-  const metricRow = { children: [hexaLabel, scoreValue] };
-  hexaLabel.parentElement = metricRow;
-  const section = {
-    parentElement: null,
-    querySelectorAll: () => [badge, hexaLabel, scoreValue],
-  };
-  badge.parentElement = section;
-  const card = {
-    contains: (element) => element === section,
-    querySelectorAll: () => [badge, hexaLabel, scoreValue],
-  };
-  const multiplierCard = {
-    querySelector: () => ({ children: [{ textContent: '25.50%' }] }),
-  };
-  const image = {
-    getAttribute: () => '/bossIcon/hard_kaling.png',
-    closest: () => multiplierCard,
-  };
-  const originalDocument = globalThis.document;
-  const originalLocation = globalThis.location;
-  globalThis.document = { querySelectorAll: () => [image] };
-  globalThis.location = { origin: 'https://maplescouter.com' };
-  const waits = [];
-  const page = {
-    goto: async () => undefined,
-    waitForSelector: async (selector) => { waits.push(selector); },
-    $$eval: async (selector, callback) => {
-      assert.deepEqual(waits, ['img[src*="/bossIcon/"]']);
-      return callback([card]);
-    },
-  };
-
-  try {
-    const result = await scrapeMapleScouterResult(page, '오잉느', new Set(['hard_kaling']));
-    assert.equal(result.boss380HexaScore, 67619);
-    assert.deepEqual([...result.multipliers], [['hard_kaling', 25.5]]);
-  } finally {
-    globalThis.document = originalDocument;
-    globalThis.location = originalLocation;
-  }
-});
 
 test('health endpoint is public', async () => {
   const response = await worker.fetch(new Request('https://worker.example.test/api/health'), env);
@@ -116,7 +69,94 @@ test('blocks an authenticated non-member from a group', async () => {
   }
 });
 
-test('accepts only a nickname for a multiplier refresh request', async () => {
+test('imports browser-captured scores for an owned character and filters group bosses', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalPrepare = env.DB.prepare;
+  const originalBatch = env.DB.batch;
+  const batches = [];
+  let characterRow = { nickname: '오잉느' };
+  globalThis.fetch = async () => Response.json({
+    sub: 'google-subject',
+    email: 'member@example.test',
+    email_verified: true,
+  });
+  env.DB.prepare = (query) => ({
+    bind: (...values) => ({
+      query,
+      values,
+      first: async () => query.includes('FROM characters')
+        ? characterRow
+        : {
+          id: 'group-1',
+          name: 'Test group',
+          created_by_sub: 'google-subject',
+          created_by_email: 'member@example.test',
+          role: 'admin',
+        },
+      all: async () => ({ results: [{ boss_id: 'hard_kaling' }] }),
+      run: async () => ({ success: true }),
+    }),
+  });
+  env.DB.batch = async (statements) => { batches.push(statements); };
+
+  const importRequest = (body) => worker.fetch(new Request('https://worker.example.test/api/characters/maplescouter-import', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }), env);
+
+  try {
+    const response = await importRequest({
+      nickname: '오잉느',
+      boss380HexaScore: 67619,
+      groupId: 'group-1',
+      multipliers: [
+        { bossId: 'hard_kaling', multiplier: 25.5 },
+        { bossId: 'normal_kaling', multiplier: 40 },
+      ],
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.deepEqual({
+      nickname: result.nickname,
+      boss380HexaScore: result.boss380HexaScore,
+      updatedMultipliers: result.updatedMultipliers,
+      ignoredMultipliers: result.ignoredMultipliers,
+    }, {
+      nickname: '오잉느',
+      boss380HexaScore: 67619,
+      updatedMultipliers: 1,
+      ignoredMultipliers: 1,
+    });
+    assert.equal(typeof result.updatedAt, 'string');
+    assert.equal(batches.length, 1);
+    assert.equal(batches[0].length, 2);
+    assert.equal(batches[0][0].query.includes('UPDATE characters'), true);
+    assert.deepEqual(batches[0][0].values, [67619, 'google-subject', '오잉느']);
+    assert.equal(batches[0][1].query.includes('INSERT INTO multipliers'), true);
+    assert.deepEqual(batches[0][1].values.slice(0, 4), ['group-1', '오잉느', 'hard_kaling', 25.5]);
+
+    characterRow = null;
+    const unownedResponse = await importRequest({ nickname: '타인캐릭터', boss380HexaScore: 67619 });
+    assert.equal(unownedResponse.status, 403);
+    assert.equal(batches.length, 1);
+
+    const invalidResponse = await importRequest({
+      nickname: '오잉느',
+      boss380HexaScore: 67619,
+      groupId: 'group-1',
+      multipliers: [{ bossId: 'hard_kaling', multiplier: 1001 }],
+    });
+    assert.equal(invalidResponse.status, 400);
+    assert.equal(batches.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.DB.prepare = originalPrepare;
+    env.DB.batch = originalBatch;
+  }
+});
+
+test('retires server-side multiplier scraping in favor of browser import', async () => {
   const originalFetch = globalThis.fetch;
   const originalPrepare = env.DB.prepare;
   globalThis.fetch = async () => new Response(JSON.stringify({
@@ -124,25 +164,14 @@ test('accepts only a nickname for a multiplier refresh request', async () => {
     email: 'member@example.test',
     email_verified: true,
   }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-  env.DB.prepare = (query) => ({
-    bind: () => ({
-      first: async () => query.includes('FROM groups') ? {
-        id: 'group-1',
-        name: 'Test group',
-        created_by_sub: 'google-subject',
-        created_by_email: 'member@example.test',
-        role: 'admin',
-      } : null,
-    }),
-  });
   try {
     const response = await worker.fetch(new Request('https://worker.example.test/api/groups/group-1/multipliers', {
       method: 'POST',
       headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
       body: JSON.stringify({ nickname: '오잉느', multipliers: [{ bossId: 'hard_kaling', multiplier: 30.67 }] }),
     }), env);
-    assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), { error: 'nickname만 요청할 수 있습니다.' });
+    assert.equal(response.status, 410);
+    assert.deepEqual(await response.json(), { error: '보스 배율은 로그인 앱의 브라우저 가져오기로 저장해 주세요.' });
   } finally {
     globalThis.fetch = originalFetch;
     env.DB.prepare = originalPrepare;
