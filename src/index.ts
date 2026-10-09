@@ -383,7 +383,7 @@ function logMapleScouterSetupFailure(stage: string, error: unknown): void {
   });
 }
 
-async function scrapeMapleScouterResult(
+export async function scrapeMapleScouterResult(
   page: import('@cloudflare/puppeteer').Page,
   nickname: string,
   bossIds: Set<string>,
@@ -393,24 +393,21 @@ async function scrapeMapleScouterResult(
     timeout: 45_000,
   });
   await page.waitForSelector('img[src*="/bossIcon/"]', { timeout: 30_000 });
-  const scraped = await page.$$eval('img[src*="/bossIcon/"]', (images) => images.flatMap((image) => {
-    const src = image.getAttribute('src') || '';
-    const filename = new URL(src, location.origin).pathname.split('/').pop() || '';
-    const bossId = filename.replace(/\.[^.]+$/, '').trim().toLowerCase();
-    const card = image.closest('div.bg-surface-gray-surface-0');
-    const infoArea = card?.querySelector('div.relative.z-10');
-    const percentages = Array.from(infoArea?.children || []).flatMap((element) => (
-      (element.textContent || '').match(/\d+(?:\.\d+)?%/g) || []
-    ));
-    const multiplier = Number(percentages.at(-1)?.replace('%', ''));
-    return bossId && Number.isFinite(multiplier) ? [{ bossId, multiplier }] : [];
-  }));
-  const multipliers = new Map<string, number>();
-  for (const item of scraped) {
-    if (bossIds.has(item.bossId)) multipliers.set(item.bossId, item.multiplier);
-  }
+  const scraped = await page.$$eval('div.bg-surface-gray-surface-0', (cards) => {
+    const multipliers = Array.from(document.querySelectorAll('img[src*="/bossIcon/"]')).flatMap((image) => {
+      const src = image.getAttribute('src') || '';
+      const filename = new URL(src, location.origin).pathname.split('/').pop() || '';
+      const bossId = filename.replace(/\.[^.]+$/, '').trim().toLowerCase();
+      const card = image.closest('div.bg-surface-gray-surface-0');
+      const infoArea = card?.querySelector('div.relative.z-10');
+      const percentages = Array.from(infoArea?.children || []).flatMap((element) => (
+        (element.textContent || '').match(/\d+(?:\.\d+)?%/g) || []
+      ));
+      const multiplier = Number(percentages.at(-1)?.replace('%', ''));
+      return bossId && Number.isFinite(multiplier) ? [{ bossId, multiplier }] : [];
+    });
 
-  const boss380HexaScore = await page.$$eval('div.bg-surface-gray-surface-0', (cards) => {
+    let boss380HexaScore: number | null = null;
     for (const card of cards) {
       const badge = Array.from(card.querySelectorAll('span'))
         .find((element) => element.textContent?.trim() === '보스380');
@@ -424,15 +421,21 @@ async function scrapeMapleScouterResult(
           .find((element) => element.tagName === 'SPAN' && element !== hexaLabel);
         if (value) {
           const score = Number((value.textContent || '').replace(/[^\d]/g, ''));
-          return Number.isSafeInteger(score) ? score : null;
+          boss380HexaScore = Number.isSafeInteger(score) ? score : null;
+          break;
         }
         section = section.parentElement;
       }
+      break;
     }
-    return null;
-  });
 
-  return { multipliers, boss380HexaScore };
+    return { multipliers, boss380HexaScore };
+  });
+  const multipliers = new Map<string, number>();
+  for (const item of scraped.multipliers) {
+    if (bossIds.has(item.bossId)) multipliers.set(item.bossId, item.multiplier);
+  }
+  return { multipliers, boss380HexaScore: scraped.boss380HexaScore };
 }
 
 async function scrapeBossMultipliers(env: Env, nickname: string, bossIds: Set<string>): Promise<MapleScouterResult> {

@@ -9,10 +9,57 @@ const compiled = ts.transpileModule(source, {
 }).outputText;
 const workerModule = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 const worker = workerModule.default;
+const { scrapeMapleScouterResult } = workerModule;
 const env = {
   DB: {},
   APP_ORIGINS: 'https://app.example.test,http://localhost:3000',
 };
+
+test('scrapes boss multipliers and Boss 380 hexa score together after boss icons load', async () => {
+  const badge = { textContent: '보스380' };
+  const hexaLabel = { tagName: 'SPAN', textContent: '헥사' };
+  const scoreValue = { tagName: 'SPAN', textContent: '67,619' };
+  const metricRow = { children: [hexaLabel, scoreValue] };
+  hexaLabel.parentElement = metricRow;
+  const section = {
+    parentElement: null,
+    querySelectorAll: () => [badge, hexaLabel, scoreValue],
+  };
+  badge.parentElement = section;
+  const card = {
+    contains: (element) => element === section,
+    querySelectorAll: () => [badge, hexaLabel, scoreValue],
+  };
+  const multiplierCard = {
+    querySelector: () => ({ children: [{ textContent: '25.50%' }] }),
+  };
+  const image = {
+    getAttribute: () => '/bossIcon/hard_kaling.png',
+    closest: () => multiplierCard,
+  };
+  const originalDocument = globalThis.document;
+  const originalLocation = globalThis.location;
+  globalThis.document = { querySelectorAll: () => [image] };
+  globalThis.location = { origin: 'https://maplescouter.com' };
+  const waits = [];
+  const page = {
+    goto: async () => undefined,
+    waitForSelector: async (selector) => { waits.push(selector); },
+    $$eval: async (selector, callback) => {
+      assert.deepEqual(waits, ['img[src*="/bossIcon/"]']);
+      return callback([card]);
+    },
+  };
+
+  try {
+    const result = await scrapeMapleScouterResult(page, '오잉느', new Set(['hard_kaling']));
+    assert.equal(result.boss380HexaScore, 67619);
+    assert.deepEqual([...result.multipliers], [['hard_kaling', 25.5]]);
+  } finally {
+    globalThis.document = originalDocument;
+    globalThis.location = originalLocation;
+  }
+});
 
 test('health endpoint is public', async () => {
   const response = await worker.fetch(new Request('https://worker.example.test/api/health'), env);
